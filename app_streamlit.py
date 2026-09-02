@@ -15,6 +15,8 @@ Build the index first:
 from __future__ import annotations
 
 import base64
+import tempfile
+from pathlib import Path
 
 import streamlit as st
 
@@ -27,7 +29,7 @@ st.set_page_config(page_title="Multimodal RAG", layout="wide")
 
 @st.cache_resource(show_spinner=True)
 def _load_index():
-    """Load the saved index once per session."""
+    """Load the saved sample index once per session."""
     try:
         return MultimodalIndex.load()
     except FileNotFoundError:
@@ -39,6 +41,37 @@ def _guard(_index):
     from src.guard import GuardedRAG
 
     return GuardedRAG(_index)
+
+
+def _build_index_from_pdf(pdf_bytes: bytes, doc_id: str) -> MultimodalIndex:
+    """Ingest an uploaded PDF (text + images) and build a fresh index from it.
+
+    The file is written to a temp path only for PyMuPDF to open, then removed.
+    The resulting index lives in the session; nothing is persisted server-side,
+    which is what we want on an ephemeral, shared host.
+    """
+    from src.ingest import ingest_pdf
+
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            suffix=".pdf", delete=False
+        ) as fh:
+            fh.write(pdf_bytes)
+            tmp = fh.name
+        ingested = ingest_pdf(tmp, doc_id=doc_id)
+        index = MultimodalIndex().build([ingested])
+        index._uploaded_stats = (  # noqa: SLF001  small UI-only annotation
+            len(ingested.text_chunks),
+            len(ingested.images),
+        )
+        return index
+    finally:
+        if tmp:
+            try:
+                Path(tmp).unlink()
+            except OSError:
+                pass
 
 
 def _show_image(index: MultimodalIndex, image_id: str) -> None:
@@ -55,22 +88,70 @@ st.caption(
     "synthetic; its numbers are illustrative."
 )
 
-index = _load_index()
-if index is None:
-    st.warning(
-        "No index found. Build one first:\n\n"
-        "```\npython scripts/make_sample_pdf.py\n"
-        "python scripts/build_index.py\n```"
-    )
-    st.stop()
+sample_index = _load_index()
 
 with st.sidebar:
+    st.subheader("Your document")
+    st.caption(
+        "Upload a PDF that mixes text and images. Both are indexed: text through "
+        "the text encoder, page images through CLIP. Your upload replaces the "
+        "sample for this session and is not stored on the server."
+    )
+    uploaded = st.file_uploader("Upload a PDF", type=["pdf"])
+    if uploaded is not None:
+        # Rebuild only when a different file is uploaded, not on every rerun.
+        sig = (uploaded.name, uploaded.size)
+        if st.session_state.get("_uploaded_sig") != sig:
+            with st.spinner(f"Ingesting {uploaded.name} (text + images)..."):
+                try:
+                    st.session_state["_uploaded_index"] = _build_index_from_pdf(
+                        uploaded.getvalue(), doc_id=Path(uploaded.name).stem
+                    )
+                    st.session_state["_uploaded_sig"] = sig
+                except Exception as exc:  # surface the reason, do not crash the app
+                    st.session_state.pop("_uploaded_index", None)
+                    st.session_state.pop("_uploaded_sig", None)
+                    st.error(f"Could not read that PDF: {exc}")
+        idx = st.session_state.get("_uploaded_index")
+        if idx is not None:
+            n_txt, n_img = getattr(idx, "_uploaded_stats", (0, 0))
+            st.success(
+                f"Indexed **{uploaded.name}**: {n_txt} text chunk(s), "
+                f"{n_img} image(s)."
+            )
+            if n_txt == 0 and n_img == 0:
+                st.warning(
+                    "No text or images were extracted. If this is a scanned PDF, "
+                    "the pages are images of text that this build does not OCR."
+                )
+    if st.session_state.get("_uploaded_index") is not None:
+        if st.button("Clear upload, use sample"):
+            st.session_state.pop("_uploaded_index", None)
+            st.session_state.pop("_uploaded_sig", None)
+            st.rerun()
+
     st.subheader("Settings")
     st.write(f"Text backend: `{SETTINGS.text_encoder_backend}`")
     st.write(f"Vision model: `{SETTINGS.vision_model}`")
     st.write(f"Guardrails: `{'on' if SETTINGS.guardrails_enabled else 'off'}`")
     st.write(f"OpenAI key present: `{SETTINGS.has_openai_key}`")
     mode = st.radio("Mode", ["Guarded RAG", "A2A (retriever + verifier)"])
+
+# The uploaded document, when present, is the active index; otherwise the sample.
+index = st.session_state.get("_uploaded_index") or sample_index
+if index is None:
+    st.info(
+        "No document loaded yet. Upload a PDF in the sidebar to get started. "
+        "It can contain both text and images."
+    )
+    st.stop()
+
+active_label = (
+    "your uploaded PDF"
+    if st.session_state.get("_uploaded_index") is not None
+    else "the synthetic sample document"
+)
+st.caption(f"Answering from: **{active_label}**.")
 
 question = st.text_input("Ask a question about the document")
 go = st.button("Ask", type="primary")
