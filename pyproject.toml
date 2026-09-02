@@ -1,0 +1,32 @@
+[project]
+name = "ai-job-search-project-3"
+version = "0.1.0"
+description = "Dual-encoder multimodal RAG with NeMo Guardrails, a LiteLLM gateway, an A2A retriever/verifier loop, and a DeepEval offline gate."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "deepeval>=4.2.0",
+    "faiss-cpu>=1.8.0",
+    "fastapi>=0.115.0",
+    "langchain-text-splitters>=1.1.2",
+    "litellm>=1.44.0",
+    "nemoguardrails>=0.24.0",
+    "openai>=1.40.0",
+    "pillow>=10.0.0",
+    "pymupdf>=1.24.0",
+    "python-dotenv>=1.2.3",
+    "python-multipart>=0.0.9",
+    "sentence-transformers>=6.0.0",
+    "streamlit>=1.36.0",
+    "transformers>=4.44.0",
+    "uvicorn>=0.30.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    # Windows only: gives portalocker a real shared lock so DeepEval's per-run
+    # cache manager does not return None and crash every test at teardown with
+    # AttributeError on 'test_cases_lookup_map'. See requirements.txt.
+    "pywin32>=306 ; sys_platform == 'win32'",
+]

@@ -1,0 +1,19 @@
+models:
+  - type: main
+    engine: openai
+    model: gpt-4o-mini
+
+# The answer is produced by our own retrieval + vision pipeline, wired in as the
+# passthrough function, not by NeMo's generic LLM generation. The input and
+# output self-check rails still run before and after that pipeline.
+passthrough: True
+
+rails:
+  input:
+    flows:
+      - self check input
+  output:
+    flows:
+      - self check output
+
+lowest_temperature: 0.0

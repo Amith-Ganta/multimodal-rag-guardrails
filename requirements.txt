@@ -1,0 +1,28 @@
+# Mirrors pyproject.toml. Install into the shared P1 venv:
+#   pip install -r requirements.txt
+deepeval>=4.2.0
+faiss-cpu>=1.8.0
+fastapi>=0.115.0
+langchain-text-splitters>=1.1.2
+litellm>=1.44.0
+nemoguardrails>=0.24.0
+openai>=1.40.0
+pillow>=10.0.0
+pymupdf>=1.24.0
+python-dotenv>=1.2.3
+python-multipart>=0.0.9
+sentence-transformers>=6.0.0
+streamlit>=1.36.0
+transformers>=4.44.0
+uvicorn>=0.30.0
+
+# dev
+pytest>=9.1.1
+
+# Windows only: DeepEval caches each test run through portalocker, which needs a
+# real shared file lock. Without pywin32, portalocker falls back to msvcrt (no
+# shared lock), DeepEval's cache manager returns None, and every test fails at
+# teardown with "AttributeError: 'NoneType' object has no attribute
+# 'test_cases_lookup_map'" even though the metric scores computed fine. Install
+# pywin32 to give portalocker the shared lock it asks for.
+pywin32>=306 ; sys_platform == "win32"

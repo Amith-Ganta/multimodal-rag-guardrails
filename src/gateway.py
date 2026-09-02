@@ -1,0 +1,142 @@
+"""A thin LLM gateway over LiteLLM.
+
+Every model call in this project goes through here, so provider choice,
+fallbacks, caching, cost tracking, and per-call logging live in one place. The
+pattern follows the course gateway notebook (LiteLLM completion + fallbacks +
+completion_cost + local cache + success/failure callbacks), adapted into a small
+class with an in-memory audit log.
+
+Multimodal note: LiteLLM's completion() takes the OpenAI-style content-array
+message shape, so vision calls (text blocks + image_url data URIs) pass straight
+through unchanged.
+"""
+
+from __future__ import annotations
+
+import logging
+import warnings
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+from .config import SETTINGS
+
+# Keep LiteLLM quiet; it is chatty on import and per call.
+warnings.filterwarnings("ignore")
+logging.getLogger("LiteLLM").setLevel(logging.ERROR)
+
+
+@dataclass
+class CallRecord:
+    model_requested: str
+    model_served: str
+    prompt_tokens: int
+    completion_tokens: int
+    latency_sec: float
+    cost_usd: float
+    cached: bool = False
+    tag: str = "anonymous"
+
+
+@dataclass
+class LLMGateway:
+    """Unified entry point for chat/vision completions across providers."""
+
+    primary_model: str = SETTINGS.vision_model
+    fallbacks: tuple[str, ...] = field(default_factory=lambda: SETTINGS.gateway_fallbacks)
+    enable_cache: bool = SETTINGS.gateway_cache
+    call_log: List[CallRecord] = field(default_factory=list)
+    _configured: bool = False
+
+    def _configure(self) -> None:
+        if self._configured:
+            return
+        import litellm
+
+        litellm.suppress_debug_info = True
+        litellm.drop_params = True  # ignore params a given provider does not support
+        if self.enable_cache:
+            from litellm.caching import Cache
+
+            litellm.cache = Cache(type="local")
+        self._configured = True
+
+    def complete(
+        self,
+        messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
+        tag: str = "anonymous",
+        temperature: float = 0.0,
+        max_tokens: Optional[int] = None,
+        use_fallbacks: bool = True,
+    ) -> str:
+        """Run one completion through the gateway and return the text.
+
+        Records model served, tokens, latency, and USD cost in call_log.
+        Fallbacks rescue the call transparently if the primary model fails.
+        """
+        import time
+
+        from litellm import completion, completion_cost
+
+        self._configure()
+        model = model or self.primary_model
+
+        kwargs: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "timeout": SETTINGS.gateway_timeout_sec,
+        }
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        if self.enable_cache:
+            kwargs["caching"] = True
+        if use_fallbacks and self.fallbacks:
+            kwargs["fallbacks"] = list(self.fallbacks)
+
+        start = time.time()
+        resp = completion(**kwargs)
+        latency = time.time() - start
+
+        try:
+            cost = float(completion_cost(completion_response=resp) or 0.0)
+        except Exception:
+            cost = 0.0
+
+        usage = getattr(resp, "usage", None)
+        record = CallRecord(
+            model_requested=model,
+            model_served=getattr(resp, "model", model),
+            prompt_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
+            completion_tokens=getattr(usage, "completion_tokens", 0) if usage else 0,
+            latency_sec=round(latency, 3),
+            cost_usd=cost,
+            cached=bool(getattr(resp, "_hidden_params", {}).get("cache_hit", False)),
+            tag=tag,
+        )
+        self.call_log.append(record)
+        return resp.choices[0].message.content or ""
+
+    # --- observability helpers --------------------------------------------
+    def total_cost(self) -> float:
+        return round(sum(r.cost_usd for r in self.call_log), 8)
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "calls": len(self.call_log),
+            "total_cost_usd": self.total_cost(),
+            "total_prompt_tokens": sum(r.prompt_tokens for r in self.call_log),
+            "total_completion_tokens": sum(r.completion_tokens for r in self.call_log),
+            "models_served": sorted({r.model_served for r in self.call_log}),
+        }
+
+
+# One shared gateway for the process.
+_GATEWAY: Optional[LLMGateway] = None
+
+
+def get_gateway() -> LLMGateway:
+    global _GATEWAY
+    if _GATEWAY is None:
+        _GATEWAY = LLMGateway()
+    return _GATEWAY

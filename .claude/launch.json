@@ -1,0 +1,21 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "streamlit",
+      "runtimeExecutable": "C:\\Users\\HP\\Desktop\\NLP\\API\\GenAI_Krish_part-1-2-3\\UDEMY-AGENITIC-AI-KRISH\\Terraform\\AI-JOB-Search-Project-1\\.venv\\Scripts\\python.exe",
+      "runtimeArgs": [
+        "-m",
+        "streamlit",
+        "run",
+        "app_streamlit.py",
+        "--server.port",
+        "8501",
+        "--server.headless",
+        "true"
+      ],
+      "port": 8501,
+      "autoPort": false
+    }
+  ]
+}

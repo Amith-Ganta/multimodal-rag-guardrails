@@ -1,0 +1,26 @@
+# --- Secrets: never commit real keys ---
+.env
+.env.*
+!.env.example
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.python-version
+
+# --- Test / eval caches and local run logs ---
+.pytest_cache/
+.deepeval/
+.deepeval-cache.json
+*.log
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+.ipynb_checkpoints/

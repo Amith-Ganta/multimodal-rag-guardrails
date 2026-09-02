@@ -1,0 +1,30 @@
+{
+  "_note": "SYNTHETIC golden set for the offline eval gate. Each item pairs a question with the expected answer facts and the source doc it should be answered from. These goldens are hand-written for the sample document in data/ and are NOT drawn from any real production traffic. Regenerate them whenever the sample document changes.",
+  "doc_id": "sample_report",
+  "goldens": [
+    {
+      "id": "g1",
+      "question": "What is the overall accuracy reported for the dual-encoder retrieval model?",
+      "expected_output": "The dual-encoder retrieval model reports an overall accuracy of 0.86 on the held-out set.",
+      "expected_facts": ["dual-encoder", "accuracy", "0.86"]
+    },
+    {
+      "id": "g2",
+      "question": "Which two embedding towers does the system use and what does each handle?",
+      "expected_output": "It uses a text tower (a sentence embedding model) for text passages and a CLIP image tower for images, indexed separately.",
+      "expected_facts": ["text tower", "CLIP image tower", "separate indexes"]
+    },
+    {
+      "id": "g3",
+      "question": "What does the bar chart on the results page show?",
+      "expected_output": "The bar chart compares retrieval accuracy across the text-only, image-only, and combined multimodal configurations, with the combined configuration highest.",
+      "expected_facts": ["bar chart", "text-only", "image-only", "combined", "highest"]
+    },
+    {
+      "id": "g4",
+      "question": "What chunk size and overlap are used when splitting document text?",
+      "expected_output": "Document text is split into chunks of 500 characters with an overlap of 100 characters.",
+      "expected_facts": ["500", "100", "overlap"]
+    }
+  ]
+}

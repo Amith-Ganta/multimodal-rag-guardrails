@@ -1,0 +1,35 @@
+# Two surfaces of the same multimodal RAG service:
+#   - ui:  Streamlit front end on http://localhost:8501
+#   - api: FastAPI back end   on http://localhost:8000
+#
+# Both read secrets from a local .env file (never committed). Retrieval runs on
+# local MiniLM and needs no key; the answering LLM needs OPENAI_API_KEY, and the
+# eval fallback judge needs GROQ_API_KEY. Copy .env.example to .env and fill in
+# your own keys before running:
+#
+#   cp .env.example .env
+#   docker compose up --build
+#
+# Bring up only one surface with, for example, `docker compose up ui`.
+services:
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: multimodal-rag-ui
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    image: multimodal-rag-api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    restart: unless-stopped
