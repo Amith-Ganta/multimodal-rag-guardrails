@@ -1,0 +1,24 @@
+# Streamlit runtime config for the deployed app.
+#
+# fileWatcherType = "none": on startup Streamlit's watcher walks every imported
+# module so it can hot-reload on source edits. transformers registers dozens of
+# "*_fast" image processors that import torchvision at module load, so the walk
+# raises a torchvision ModuleNotFoundError for each one and floods the logs. The
+# app still runs (the watcher swallows those errors), but the noise buries any
+# real message. A deployed app is never being edited in place, so the watcher
+# earns nothing here; turning it off removes the whole scan and the noise with
+# it. It also saves the CPU and memory the scan would spend on every rerun,
+# which matters on the free tier.
+[server]
+fileWatcherType = "none"
+headless = true
+enableCORS = false
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false
+
+[runner]
+# Surface uncaught exceptions in the UI rather than only the logs, so a failure
+# on this shared host is visible to whoever opens the app.
+fastReruns = true
