@@ -14,6 +14,11 @@ python-multipart>=0.0.9
 sentence-transformers>=6.0.0
 streamlit>=1.36.0
 transformers>=4.44.0
+# transformers lazily imports torchvision from its image-processing submodules at
+# startup (CLIP among them); without it the import raises ModuleNotFoundError and
+# floods the logs. Left unpinned so pip resolves the build that matches the torch
+# it installs from the same index; a hard pin risks a torch/torchvision mismatch.
+torchvision>=0.15.0
 uvicorn>=0.30.0
 
 # dev
