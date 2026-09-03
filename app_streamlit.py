@@ -49,11 +49,24 @@ def _load_index():
         return None
 
 
-@st.cache_resource(show_spinner=False)
-def _guard(_index):
+def _guard(index: MultimodalIndex):
+    """Build (or reuse from session state) the GuardedRAG for this exact index.
+
+    Must not be @st.cache_resource: that decorator treats an underscore-prefixed
+    arg as excluded from the cache key, so a single cached GuardedRAG would be
+    returned for every index (sample or uploaded) after the first call, and the
+    app would keep answering from whichever document built it first. Keying by
+    `id(index)` in session_state instead means a fresh index (a new upload, or
+    clearing back to the sample) always gets its own GuardedRAG.
+    """
     from src.guard import GuardedRAG
 
-    return GuardedRAG(_index)
+    cache = st.session_state.setdefault("_guard_cache", {})
+    key = id(index)
+    if key not in cache:
+        cache.clear()  # drop any GuardedRAG built for a now-replaced index
+        cache[key] = GuardedRAG(index)
+    return cache[key]
 
 
 def _build_index_from_pdf(pdf_bytes: bytes, doc_id: str) -> MultimodalIndex:

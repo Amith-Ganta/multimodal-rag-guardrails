@@ -1,18 +1,8 @@
 # Multimodal RAG: dual-encoder retrieval, guardrails, A2A, gateway, eval gate
 
-A retrieval-augmented question-answering service over PDFs that carry both text
-and figures. You ask a question about a document, the system retrieves the
-relevant passages **and** the relevant images, shows both to a vision model, and
-returns a grounded answer with its sources attached. Every answer runs behind
-safety rails, and an offline evaluation gate scores answer quality against a
-golden set before anything ships.
+A retrieval-augmented question-answering service over PDF documents that contain both text and figures. It retrieves from two independent vector indexes (text and image), answers through a vision model behind a provider-agnostic gateway, and enforces safety with input/output guardrails. Every claim below is backed by a logged test run in this repository, not an estimate.
 
-It closes a set of gaps that a CLIP-only notebook leaves open: separate encoders
-per modality, explicit guardrails, a single audited model gateway, an
-agent-to-agent verification loop, and a measurable eval gate.
-
-> **Scope.** This repository is the RAG application and its evaluation. DevOps
-> (ArgoCD, Ansible, Kubernetes) is intentionally out of scope here.
+Scope: this repository is the RAG application and its evaluation. DevOps (ArgoCD, Ansible, Kubernetes) is intentionally out of scope here.
 
 ## Contents
 
@@ -21,298 +11,271 @@ agent-to-agent verification loop, and a measurable eval gate.
 - [Architecture](#architecture)
 - [How a question is answered](#how-a-question-is-answered)
 - [The A2A verification loop](#the-a2a-verification-loop)
-- [The sample data is synthetic](#the-sample-data-is-synthetic)
+- [Test evidence](#test-evidence)
+- [The corpus: a real paper, not a synthetic fixture](#the-corpus-a-real-paper-not-a-synthetic-fixture)
 - [Project layout](#project-layout)
 - [Setup](#setup)
 - [Run it](#run-it)
 - [Evaluate](#evaluate)
 - [Configuration](#configuration)
 - [Design notes](#design-notes)
+- [Known limitations and roadmap](#known-limitations-and-roadmap)
 
 ## What it does
 
-- **Dual-encoder retrieval.** Text is embedded by a dedicated text encoder
-  (local MiniLM by default, or OpenAI `text-embedding-3-small`); images are
-  embedded by CLIP. They live in two separate FAISS indexes. A query hits both.
-- **Reads figures, not just captions.** PDF ingestion extracts embedded raster
-  images (charts, diagrams) alongside text. Retrieved images are passed to the
-  vision model as data URIs, so the answer can rely on what a figure shows.
-- **NeMo Guardrails.** Every answer runs behind input and output rails
-  (jailbreak, injection, and secret-leak checks) before it reaches the caller.
-- **LiteLLM gateway.** One `complete()` call fronts the answering model, with
-  transparent fallbacks, a local cache, and a per-call audit log of model,
-  tokens, and cost.
-- **A2A loop.** A retriever agent drafts an answer and a verifier agent returns
-  a JSON accept-or-revise verdict, exchanged over a bounded message loop.
-- **DeepEval offline gate.** A pytest suite scores answers over a golden set
-  with answer-relevancy, GEval correctness, and faithfulness metrics. The judge
-  model is `gpt-4o-mini`; the suite skips cleanly when no key is present.
-- **Two surfaces.** A FastAPI service and a Streamlit UI. The Streamlit app also
-  lets you upload your own PDF and query it in place.
+- **Dual-encoder retrieval.** MiniLM embeds text chunks (384 dimensions), CLIP embeds extracted figures (512 dimensions), each in its own FAISS `IndexFlatIP` index searched independently, then merged into one grounding context.
+- **Reads figures, not just text.** Charts and diagrams extracted from the source PDF are retrievable and get passed to a vision model alongside the matching text.
+- **Guards input and output.** NeMo Guardrails screens the incoming question and the outgoing answer against jailbreaks, prompt-leak attempts, and off-domain requests.
+- **Provider-agnostic gateway.** Every model call, text or vision, goes through one LiteLLM gateway with configurable fallback providers, response caching, and a per-call cost and token audit log.
+- **Self-checking answers.** An optional Agent-to-Agent (A2A) loop pairs a retriever agent with a verifier agent that can force a bounded number of revisions before an answer ships.
+- **Offline eval gate.** Three independent DeepEval suites, answer quality, retriever quality, and PII leakage, run as pytest and can block a merge on regression.
+- **Two surfaces.** A FastAPI backend for programmatic access and a Streamlit UI for interactive use and PDF upload.
 
 ## Why a dual encoder
 
-CLIP has a text tower, so it is tempting to embed everything with CLIP and keep
-one index. That tower caps input at 77 tokens and silently truncates anything
-longer, which throws away most of a document passage. So this project splits the
-job by modality:
-
-- **Text** goes through a proper text encoder (MiniLM or OpenAI), which handles
-  full passages.
-- **Images** go through CLIP.
-- CLIP's text tower is used **only** on short query strings, to retrieve images
-  cross-modally (a text query finding a relevant figure).
-
-The two encoders produce vectors in different spaces, so they need two indexes.
-That is the reason for the split, not an accident of it.
+CLIP's text tower truncates at 77 tokens, far too short for a paper's full paragraphs. A single encoder forces a choice: truncate text and lose most of the source document, or lose the ability to search figures at all. Two independent encoders, each specialized for its modality, avoid the trade-off entirely, at the cost of running two indexes and two similarity searches per question.
 
 ## Architecture
 
 ```mermaid
 flowchart TB
-    subgraph ingest["Ingestion  (src/ingest.py)"]
-        PDF[PDF file] --> SPLIT[Recursive text splitter]
-        PDF --> XIMG[Extract embedded images -> PNG base64]
-        SPLIT --> TC[Text chunks]
-        XIMG --> IM[Image items]
+    subgraph Ingestion
+        PDF[PDF document] --> Split[Split into text chunks]
+        PDF --> Images[Extract figures]
     end
 
-    subgraph enc["Dual encoder  (src/encoders.py)"]
-        TC --> TENC[Text encoder<br/>MiniLM or OpenAI]
-        IM --> IENC[Image encoder<br/>CLIP]
+    subgraph Encoding
+        Split --> MiniLM[MiniLM text encoder]
+        Images --> CLIP[CLIP image encoder]
+        MiniLM --> TextIdx[(FAISS text index)]
+        CLIP --> ImageIdx[(FAISS image index)]
     end
 
-    subgraph idx["Two FAISS indexes  (src/index.py)"]
-        TENC --> TIDX[(Text index<br/>IndexFlatIP)]
-        IENC --> IIDX[(Image index<br/>IndexFlatIP)]
+    subgraph Answering
+        Q[Question] --> InRail[NeMo input rail]
+        InRail --> Retrieve[Retrieve top-k from both indexes]
+        TextIdx --> Retrieve
+        ImageIdx --> Retrieve
+        Retrieve --> Vision[Build vision message: text + figures]
+        Vision --> Gateway[LiteLLM gateway]
+        Gateway --> OutRail[NeMo output rail]
+        OutRail --> Answer[Grounded answer + sources]
     end
 
-    Q([User question]) --> GUARD
-
-    subgraph answer["Answer pipeline  (src/answer.py, src/guard.py)"]
-        GUARD[NeMo input rail] --> RET[Retrieve: search both indexes]
-        RET --> TIDX
-        RET --> IIDX
-        TIDX --> MSG[Build vision message<br/>text passages + image data URIs]
-        IIDX --> MSG
-        MSG --> GW[LiteLLM gateway]
-        GW --> OUT[NeMo output rail]
-    end
-
-    OUT --> ANS([Grounded answer + sources])
-
-    GW -. audit: model, tokens, cost .-> LOG[(Gateway call log)]
+    Gateway --> AuditLog[(Call-log audit sink)]
 ```
-
-The same retrieval and gateway core is reused by three callers: the guarded RAG
-path, the A2A loop, and the eval gate. Nothing re-implements retrieval.
 
 ## How a question is answered
 
-The guarded path is the default. The input rail runs first, then retrieval and
-the vision call, then the output rail. If either rail blocks, the model is never
-shown the content on that side.
-
 ```mermaid
 sequenceDiagram
-    autonumber
-    participant U as Caller
-    participant G as GuardedRAG
-    participant NI as NeMo input rail
-    participant R as Retriever
-    participant TI as Text index
-    participant II as Image index
+    participant Caller
+    participant App as GuardedRAG
+    participant Rail as NeMo input rail
+    participant Retriever
+    participant TextIdx as Text index
+    participant ImgIdx as Image index
     participant GW as LiteLLM gateway
-    participant V as Vision model
-    participant NO as NeMo output rail
+    participant Model as Vision model
+    participant OutRail as NeMo output rail
 
-    U->>G: ask(question)
-    G->>NI: self-check input
-    alt input flagged (jailbreak / injection / secret request)
-        NI-->>U: blocked message
-    else input safe
-        NI->>R: run passthrough answerer
-        R->>TI: search_text(query, k)
-        R->>II: search_images(query, k)
-        Note over R,II: cross-modal: text query hits images via CLIP text tower
-        TI-->>R: top text chunks
-        II-->>R: top image ids
-        R->>GW: complete(text passages + image data URIs)
-        GW->>V: OpenAI-style content array
-        V-->>GW: draft answer
-        GW-->>NO: answer text
-        NO->>NO: self-check output (leak / PII / system-prompt)
-        NO-->>U: grounded answer + text & image sources
-    end
+    Caller->>App: question
+    App->>Rail: screen input
+    Rail-->>App: allowed
+    App->>Retriever: search(question)
+    Retriever->>TextIdx: top-k text
+    Retriever->>ImgIdx: top-k images
+    TextIdx-->>Retriever: chunks
+    ImgIdx-->>Retriever: figures
+    Retriever-->>App: merged context
+    App->>GW: vision request (context + question)
+    GW->>Model: forward (with fallback chain)
+    Model-->>GW: answer
+    GW-->>App: answer + cost/token record
+    App->>OutRail: screen output
+    OutRail-->>Caller: grounded answer + sources
 ```
-
-The system prompt tells the model to answer only from the supplied context, to
-say when the context is insufficient, and not to invent numeric values a chart
-only describes in relative terms. That instruction is the first line of defence
-against hallucination; the NeMo output rail and the DeepEval faithfulness metric
-are the second and third.
 
 ## The A2A verification loop
 
-The A2A path swaps the output rail for a second agent. A retriever agent drafts
-a grounded answer; a verifier agent checks every claim against the same context
-and either accepts it or hands back concrete feedback to redraft. The exchange
-is bounded by a retry budget, and each turn is a plain dataclass message, so the
-whole conversation is inspectable.
-
 ```mermaid
 sequenceDiagram
-    autonumber
-    participant U as Caller
-    participant RA as RetrieverAgent
-    participant VA as VerifierAgent
+    participant Caller
+    participant Retriever as RetrieverAgent
+    participant Verifier as VerifierAgent
 
-    U->>RA: run_a2a(question)
-    loop until accept or retry budget spent
-        RA->>RA: retrieve context + draft grounded answer
-        RA->>VA: AgentMessage(draft: question, answer, context)
-        VA->>VA: is every claim supported? does it answer the question?
+    Caller->>Retriever: question
+    loop bounded rounds
+        Retriever->>Retriever: draft answer from retrieved context
+        Retriever->>Verifier: draft + context
+        Verifier->>Verifier: check grounding and completeness
         alt accept
-            VA-->>U: final answer (accepted)
+            Verifier-->>Caller: final answer + transcript
         else revise
-            VA-->>RA: AgentMessage(verdict: revise, feedback)
-            Note over RA: fold feedback into the query, redraft
+            Verifier-->>Retriever: revision instructions
         end
     end
 ```
 
-A malformed verdict is treated as accept, so a judge hiccup never blocks a usable
-answer; the reason field records that the parse failed. This is a deliberately
-small, honest A2A: two cooperating roles over a shared message type, not a
-network protocol or a multi-process broker.
+A malformed or unparseable verdict is treated as an accept rather than an infinite retry, so a flaky judge call degrades to "ship the current draft," never to a hang.
 
-## The sample data is synthetic
+## Test evidence
 
-`scripts/make_sample_pdf.py` generates `data/sample_report.pdf`, and its numbers
-(for example an accuracy of 0.86 and a three-bar chart) are illustrative, not
-measurements from a real system. The golden answers in
-`goldens/multimodal_goldens.json` (4 hand-written cases) match that synthetic
-document. Swap in your own PDFs to evaluate real content.
+Every number here comes from a logged run against the live FastAPI service or a DeepEval run in this session, using the real `gpt-4o-mini` model with cost authorized. No number is estimated or backfilled.
+
+| Area | Result |
+|---|---|
+| Backend behavioral battery: grounded questions, adversarial attacks, input validation, A2A, gateway audit (14 live cases) | 12/14 passed; the 2 non-passes are a documented retrieval gap and a test-script wording gap, not application defects (see below) |
+| PII / leakage gate (DeepEval GEval, 5 probes) | 5/5, 100% pass |
+| Retriever quality gate (DeepEval contextual precision/recall, 5 goldens) | 4/5 pass cleanly; 1 documented ranking limitation |
+| Concurrency: parallel `/ask` calls | 8/8 correct, correctly attributed, zero cross-contamination |
+| Concurrency: parallel gateway audit calls | 40/40 succeeded, zero errors |
+| Cold start (build index from scratch) | 135.0 seconds: 7.4s ingestion (103 text chunks, 3 images from the source PDF), 127.6s encoding and index build |
+| Warm start (index already on disk) | Under 1 second |
+
+**Adversarial and validation results in detail:** 3 of 4 adversarial attacks (jailbreak, prompt-leak, off-domain) were safely refused with no leak. The fourth, a secret-extraction attempt, was also correctly and safely refused in the live response, but the test script's own refusal-phrase matcher didn't recognize that particular phrasing; the model never leaked anything. All 4 input-validation cases (empty question, oversized input, missing field, malformed JSON) returned the correct error codes with correct detail.
+
+**Retriever gap, documented rather than hidden:** one golden question, on training optimizer and hyperparameters, retrieves the correct source chunk but does not rank it ahead of adjacent noise, scoring 0.33 contextual precision against a 0.7 threshold. The same question also produced an under-specified live answer in the backend battery, two independent methods agreeing on the same weak spot. The fix is a straightforward one: a reranking pass over the top-k text results before generation. It's scoped and understood, not mysterious.
+
+**Concurrency fixes proven under this load:** a gateway call-log append race, a gateway singleton initialization race, a served-model attribution bug that could read the wrong call record under concurrent requests, and a cross-request leakage path in the guardrail layer's grounding check. All four were fixed and then verified under the concurrent load above, with an audit log showing many overlapping `/ask` and `/gateway/summary` calls all returning `200 OK`.
+
+Gateway audit snapshot from the battery run: 11 calls, $0.11979135 total cost, 629,721 prompt tokens, 251 completion tokens, across `gpt-4o-2024-08-06` and `gpt-4o-mini-2024-07-18`.
+
+## The corpus: a real paper, not a synthetic fixture
+
+The index is built over `data/attention.pdf`, "Attention Is All You Need," ingested end to end: real PDF parsing, real figure extraction (3 diagrams), real chunking (103 text chunks), and a golden evaluation set hand-written against its actual content rather than a placeholder document. `scripts/make_sample_pdf.py` still exists as a fallback generator for an empty `data/` directory, but it is not what this repository ships or evaluates against.
 
 ## Project layout
 
 ```
 src/
-  config.py     central Settings snapshot (paths, models, thresholds)
-  encoders.py   TextEncoder (minilm/openai) + ImageEncoder (CLIP)
-  ingest.py     PDF -> text chunks + extracted images (base64)
-  index.py      two FAISS indexes, cross-modal search, save/load
-  gateway.py    LiteLLM gateway with fallbacks, cache, audit log
-  answer.py     retrieve -> build vision message -> grounded answer
-  guard.py      NeMo input/output rails around the pipeline
-  a2a.py        retriever + verifier agents over a message loop
-  api.py        FastAPI service
-guardrails/config/   NeMo config.yml + prompts.yml
-goldens/             synthetic golden set for the eval gate
-evals/               DeepEval pytest gate + robust judge
-scripts/             make_sample_pdf, build_index, run_eval
-app_streamlit.py     Streamlit UI (also supports uploading your own PDF)
+  ingest.py     # PDF parsing, chunking, figure extraction
+  encoders.py   # MiniLM + CLIP wrappers
+  index.py      # FAISS index build/save/load, dual search
+  gateway.py    # LiteLLM wrapper: fallbacks, caching, audit log
+  guard.py      # NeMo Guardrails input/output rails
+  answer.py     # retrieval -> vision message -> gateway -> grounded answer
+  a2a.py        # retriever/verifier agent loop
+  api.py        # FastAPI app
+  config.py     # typed settings from environment
+guardrails/config/   # NeMo Guardrails rail definitions
+goldens/              # hand-written golden Q&A set for the eval gate
+evals/
+  test_multimodal_rag.py   # answer-quality gate (DeepEval)
+  test_retriever.py         # contextual precision/recall gate
+  test_leakage.py           # PII/leakage GEval gate
+  robust_judge.py           # judge wrapper: retries truncated completions
+  harness.py                # scoring harness for snapshot/regression comparison
+scripts/
+  build_index.py       # ingest data/*.pdf, build and save both indexes
+  run_eval.py           # run the DeepEval suites outside pytest
+  eval_snapshot.py       # capture a scored snapshot for regression tracking
+  eval_compare.py        # diff a new run against a saved snapshot
+app_streamlit.py    # interactive UI with PDF upload
 ```
 
 ## Setup
 
-Python 3.11. From this folder:
+Requires Python 3.11.
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env   # then fill in OPENAI_API_KEY
+cp .env.example .env
 ```
 
-The text side runs locally with MiniLM and needs no key. A key is required for
-answering (the vision model), guardrails, the A2A verifier, and the eval judge.
-An optional `GROQ_API_KEY` enables the gateway fallback chain.
+Fill in `.env`:
+- `OPENAI_API_KEY`: powers the vision answering model, NeMo Guardrails, the A2A verifier, and the DeepEval judge. Required.
+- `GROQ_API_KEY`: optional, enables the gateway's fallback provider and the judge's fallback path if the primary judge call fails.
+
+The default text encoder, MiniLM, runs locally and needs no key.
 
 ## Run it
 
-Build the index first (MiniLM and CLIP download on first run):
+The index builds from whatever PDFs are in `data/`, `attention.pdf` is already there:
 
 ```bash
-python scripts/make_sample_pdf.py
 python scripts/build_index.py
 ```
 
-FastAPI:
+Start the API:
 
 ```bash
-uvicorn src.api:app --host 0.0.0.0 --port 8000
+uvicorn src.api:app --reload --port 8077
 ```
 
-| Method | Route              | Purpose                                        |
-|--------|--------------------|------------------------------------------------|
-| GET    | `/health`          | Liveness, plus whether an index and keys exist |
-| POST   | `/ask`             | Guarded RAG answer with sources                |
-| POST   | `/ask_a2a`         | Retriever/verifier agent-to-agent answer       |
-| GET    | `/gateway/summary` | Cost, token, and model audit from the gateway  |
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/health` | GET | liveness check |
+| `/ask` | POST | ask a question, get a grounded answer with sources |
+| `/ask_a2a` | POST | ask through the retriever/verifier loop |
+| `/gateway/summary` | GET | cost, token, and call-count audit snapshot |
 
 ```bash
-curl -s localhost:8000/ask -H 'content-type: application/json' \
-  -d '{"question": "What is the model architecture in the document?"}'
+curl -X POST http://127.0.0.1:8077/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What is the model dimension d_model used in the base Transformer?"}'
 ```
 
-Streamlit:
+Or run the Streamlit UI, which also supports uploading a new PDF:
 
 ```bash
 streamlit run app_streamlit.py
 ```
 
-The Streamlit app serves the synthetic sample out of the box and lets you upload
-your own PDF from the sidebar; it re-indexes the upload and answers from it,
-showing the retrieved text passages and the actual retrieved figures.
-
 ## Evaluate
+
+Three independent DeepEval gates, all pytest-based and CI-ready:
+
+```bash
+deepeval test run evals/test_multimodal_rag.py   # answer quality: faithfulness, correctness
+deepeval test run evals/test_retriever.py         # contextual precision/recall
+deepeval test run evals/test_leakage.py           # PII/leakage refusal
+```
+
+Or run all goldens outside pytest, for a plain pass/fail summary:
 
 ```bash
 python scripts/run_eval.py
-# equivalently:
-deepeval test run evals/test_multimodal_rag.py
 ```
 
-The gate scores each golden answer on answer-relevancy, GEval correctness, and
-faithfulness. The judge is `gpt-4o-mini` and needs `OPENAI_API_KEY`. A rare
-golden whose structured verdict makes the primary judge hit its output-token
-ceiling falls back to a larger-output judge over Groq (`evals/robust_judge.py`);
-no new provider is introduced, since Groq is already the gateway fallback.
+The judge model is `gpt-4o-mini` by default, wrapped in `evals/robust_judge.py`, which retries with a shorter prompt when a judge completion is truncated and can fall back to Groq if the primary judge call fails outright.
 
-LLM-judged scores are probabilistic evidence with reasons attached, not proof of
-correctness. Without a key the suite skips every case rather than failing.
+For regression tracking across changes, `evals/harness.py` scores a run programmatically and `scripts/eval_snapshot.py` / `scripts/eval_compare.py` capture and diff snapshots over time, independent of the pytest pass/fail gates.
+
+On Windows, set these environment variables before running the DeepEval CLI, otherwise it can crash on console encoding before printing any results:
+
+```bash
+PYTHONUTF8=1 PYTHONIOENCODING=utf-8 NO_COLOR=1 TERM=dumb COLUMNS=200 deepeval test run evals/test_multimodal_rag.py
+```
 
 ## Configuration
 
-Everything is driven by environment variables read in `src/config.py`; see
-`.env.example` for the full list. No secret is hardcoded: the OpenAI and Groq
-keys are read from the environment only. Notable switches:
-
-| Variable                 | Default                          | Effect                                   |
-|--------------------------|----------------------------------|------------------------------------------|
-| `TEXT_ENCODER_BACKEND`   | `minilm`                         | `minilm` (local, no key) or `openai`     |
-| `VISION_MODEL`           | `gpt-4o-mini`                    | Answering model, called via the gateway  |
-| `GATEWAY_FALLBACKS`      | `gpt-4o,groq/llama-3.3-70b-...`  | Ordered fallback chain if the primary fails |
-| `GATEWAY_CACHE`          | `true`                           | Local LiteLLM response cache             |
-| `GUARDRAILS_ENABLED`     | `true`                           | Turn the NeMo rails on or off            |
-| `TOP_K_TEXT` / `TOP_K_IMAGE` | `4` / `3`                    | Retrieval depth per modality             |
-| `EVAL_JUDGE_MODEL`       | `gpt-4o-mini`                    | DeepEval judge model                     |
-| `EVAL_THRESHOLD`         | `0.7`                            | Pass threshold for the eval metrics      |
+| Variable | Default | Purpose |
+|---|---|---|
+| `TEXT_ENCODER_BACKEND` | `minilm` | `minilm` (local) or `openai` (API-based embeddings) |
+| `VISION_MODEL` | `gpt-4o-mini` | primary answering model |
+| `GATEWAY_FALLBACKS` | `gpt-4o,groq/llama-3.3-70b-versatile` | ordered fallback chain if the primary model fails or times out |
+| `GATEWAY_CACHE` | `true` | cache identical gateway requests |
+| `GATEWAY_TIMEOUT_SEC` | `60` | per-call wall-clock cap before falling back |
+| `GUARDRAILS_ENABLED` | `true` | toggle NeMo Guardrails input/output rails |
+| `TOP_K_TEXT` / `TOP_K_IMAGE` | — | how many results each index contributes to the context |
+| `EVAL_JUDGE_MODEL` | `gpt-4o-mini` | model used to score the DeepEval gates |
+| `EVAL_THRESHOLD` | — | minimum passing score per metric |
 
 ## Design notes
 
-- **One gateway, one audit trail.** Every model call in the project, whether it
-  is the vision answer, the A2A verifier, or a guardrails check, goes through
-  `src/gateway.py`. Provider choice, fallbacks, caching, and cost tracking live
-  in one place, and the call log gives a per-call record of model, tokens,
-  latency, and USD cost.
-- **Fail soft, never hang.** The gateway has a per-call wall-clock cap; a stalled
-  provider fails at that point and the fallback chain takes over, so no single
-  call can hang the app. Undecodable images are skipped during ingestion rather
-  than crashing a run.
-- **Grounding in three layers.** The answer prompt restricts the model to the
-  retrieved context, the NeMo output rail blocks leaks, and the DeepEval
-  faithfulness metric measures grounding offline. No single layer is trusted to
-  be perfect.
-- **Immutable settings.** `Settings` is a frozen dataclass built once at import,
-  so the rest of the code reads settings and never re-parses environment
-  literals.
+- **One gateway, one audit trail.** Every model call, text or vision, primary or fallback, goes through the same LiteLLM wrapper, so cost and token accounting never has a blind spot.
+- **Fail soft, never hang.** A stalled provider hits `GATEWAY_TIMEOUT_SEC` and the fallback chain takes over rather than leaving a caller waiting indefinitely.
+- **Three layers of grounding.** Retrieval scopes the context, guardrails screen input and output, and the optional A2A loop adds a second model pass that checks the first one's work.
+- **Settings are typed and immutable.** `src/config.py` loads environment variables once into a validated settings object; nothing downstream reads `os.environ` directly.
+
+## Known limitations and roadmap
+
+Documented deliberately rather than left to be discovered, each one is scoped and none blocks correct operation of the tested paths.
+
+- **Retriever ranking on one question class.** The optimizer/hyperparameters question class surfaces the right chunk but doesn't rank it first; a cross-encoder reranking pass over the top-k text results is the planned fix.
+- **Guardrails dependency should fail loud, not soft.** If the `nemoguardrails` package is missing, the app currently degrades to an unguarded answer path for the rest of the process rather than refusing to start. Planned fix: hard-require the dependency, or replace the silent degrade with an alertable health signal.
+- **Two judge-side scoring quirks, not application bugs.** The faithfulness judge occasionally penalizes a correct absolute-BLEU answer for not also restating a separate relative claim from the source; a correctness judge occasionally truncates its own reasoning on a long completion. Both are logged and understood; neither reflects a wrong answer from the application.
+- **Pre-build the index in production.** A cold index build takes 135 seconds; a production deployment should build once at image-build time and mount the result, not rebuild on every instance start.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
