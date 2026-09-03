@@ -171,6 +171,12 @@ class LLMGateway:
             "total_cost_usd": round(sum(r.cost_usd for r in records), 8),
             "total_prompt_tokens": sum(r.prompt_tokens for r in records),
             "total_completion_tokens": sum(r.completion_tokens for r in records),
+            "avg_latency_sec": (
+                round(sum(r.latency_sec for r in records) / len(records), 3)
+                if records
+                else 0.0
+            ),
+            "total_latency_sec": round(sum(r.latency_sec for r in records), 3),
             "models_served": sorted({r.model_served for r in records}),
         }
 

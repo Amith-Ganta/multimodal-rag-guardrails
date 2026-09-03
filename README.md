@@ -2,6 +2,8 @@
 
 A retrieval-augmented question-answering service over PDF documents that contain both text and figures. It retrieves from two independent vector indexes (text and image), answers through a vision model behind a provider-agnostic gateway, and enforces safety with input/output guardrails. Every claim below is backed by a logged test run in this repository, not an estimate.
 
+Live demo: [multimodal-rag-guardrails.streamlit.app](https://multimodal-rag-guardrails-4nfswoz8hv5katmnevvzuq.streamlit.app/) (upload your own PDF, or ask questions against the default paper).
+
 Scope: this repository is the RAG application and its evaluation. DevOps (ArgoCD, Ansible, Kubernetes) is intentionally out of scope here.
 
 ## Contents
