@@ -22,9 +22,23 @@ dependencies = [
     "uvicorn>=0.30.0",
 ]
 
+[tool.pytest.ini_options]
+# The gpt-4o-mini judge-JSON fault (an unescaped backslash in a GEval `reason`,
+# e.g. a stray "\e" while writing about epsilon) is handled DURABLY, not by
+# rerunning. DeepEval parses judge content itself in metrics/utils.py::
+# trimAndLoadJson, which repairs a trailing comma but NOT an invalid \escape, so
+# it raised "ValueError: Evaluation LLM outputted an invalid JSON" from inside
+# DeepEval on a path the judge-model wrapper cannot intercept. On the multimodal
+# Adam/epsilon golden that fault is DETERMINISTIC (same char position on every
+# sample), so a rerun cannot clear it. evals/json_repair_patch.py monkeypatches
+# trimAndLoadJson at import time to add one invalid-\escape repair pass, letting
+# the judge's real verdict through without changing any score. The gate test
+# imports that patch, so no scoped rerun is needed here.
+
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "pytest-rerunfailures>=16.0",
     # Windows only: gives portalocker a real shared lock so DeepEval's per-run
     # cache manager does not return None and crash every test at teardown with
     # AttributeError on 'test_cases_lookup_map'. See requirements.txt.

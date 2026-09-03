@@ -31,6 +31,13 @@ from pathlib import Path
 
 import pytest
 
+# Import-time patch: repairs one specific malformed-JSON case in DeepEval's
+# judge-output parser (an unescaped backslash in a GEval `reason`) that gpt-4o-mini
+# emits deterministically on at least one golden. Must run before any GEval metric
+# is constructed. See evals/json_repair_patch.py for the full rationale; it changes
+# no score or verdict, only lets a syntactically-broken judge reply be read.
+import evals.json_repair_patch  # noqa: F401
+
 from src.answer import answer_query
 from src.config import GOLDENS_DIR, SETTINGS
 from src.index import MultimodalIndex
@@ -139,6 +146,16 @@ def test_golden_answer(index, golden):
     )
     metrics = [correctness, relevancy]
     if retrieval_context:
+        # Known judge limitation on g4 (the BLEU golden). The app answer states
+        # the correct ABSOLUTE scores, 28.4 (En-De) and 41.8 (En-Fr), and the
+        # grounding sentence "establishes a new state-of-the-art BLEU score of
+        # 28.4" IS present in retrieval_context. FaithfulnessMetric nonetheless
+        # sometimes scores this 0.5, conflating the absolute 28.4 with the
+        # paper's separate RELATIVE claim ("outperforms ... by more than 2.0
+        # BLEU"). Correctness (0.96) and Relevancy (1.0) pass; the answer is
+        # right and grounded. We deliberately do NOT auto-retry or drop
+        # Faithfulness here -- suppressing a real (if occasionally mistaken)
+        # metric signal would be gaming the gate. It is documented instead.
         metrics.append(
             FaithfulnessMetric(
                 threshold=THRESHOLD, model=judge, include_reason=True

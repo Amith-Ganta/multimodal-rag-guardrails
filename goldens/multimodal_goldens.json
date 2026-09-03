@@ -1,30 +1,36 @@
 {
-  "_note": "SYNTHETIC golden set for the offline eval gate. Each item pairs a question with the expected answer facts and the source doc it should be answered from. These goldens are hand-written for the sample document in data/ and are NOT drawn from any real production traffic. Regenerate them whenever the sample document changes.",
-  "doc_id": "sample_report",
+  "_note": "Golden set for the offline eval gate, grounded in the REAL document data/attention.pdf ('Attention Is All You Need', Vaswani et al., 2017). Every expected fact was read directly from the retrieved chunks of the built index (not from memory): h=8 heads and dk=dv=64 from p4::c1, d_model=512 from p4::c6, sine/cosine positional encodings from p5::c2-3, BLEU 28.4 EN-DE and 41.8 EN-FR from p0::c3 and p7::c3, Adam beta1=0.9 beta2=0.98 from p6::c7, WMT 2014 from p6::c4. The image golden targets Figure 2 (the attention diagrams) on page 3. Regenerate whenever the source document changes.",
+  "doc_id": "attention",
   "goldens": [
     {
       "id": "g1",
-      "question": "What is the overall accuracy reported for the dual-encoder retrieval model?",
-      "expected_output": "The dual-encoder retrieval model reports an overall accuracy of 0.86 on the held-out set.",
-      "expected_facts": ["dual-encoder", "accuracy", "0.86"]
+      "question": "How many attention heads does the Transformer use, and what is the dimension of each head?",
+      "expected_output": "The Transformer uses h = 8 parallel attention heads, and each head has dimension dk = dv = dmodel/h = 64.",
+      "expected_facts": ["8", "heads", "64"]
     },
     {
       "id": "g2",
-      "question": "Which two embedding towers does the system use and what does each handle?",
-      "expected_output": "It uses a text tower (a sentence embedding model) for text passages and a CLIP image tower for images, indexed separately.",
-      "expected_facts": ["text tower", "CLIP image tower", "separate indexes"]
+      "question": "How does the Transformer inject information about token position, given it has no recurrence or convolution?",
+      "expected_output": "It adds positional encodings to the input embeddings, using sine and cosine functions of different frequencies, with the same dimension dmodel as the embeddings so the two can be summed.",
+      "expected_facts": ["positional encoding", "sine", "cosine"]
     },
     {
       "id": "g3",
-      "question": "What does the bar chart on the results page show?",
-      "expected_output": "The bar chart compares retrieval accuracy across the text-only, image-only, and combined multimodal configurations, with the combined configuration highest.",
-      "expected_facts": ["bar chart", "text-only", "image-only", "combined", "highest"]
+      "question": "What does Figure 2 in the paper illustrate about the attention mechanism?",
+      "expected_output": "Figure 2 shows Scaled Dot-Product Attention on the left and Multi-Head Attention on the right, where multi-head attention runs several attention layers in parallel.",
+      "expected_facts": ["Scaled Dot-Product Attention", "Multi-Head Attention"]
     },
     {
       "id": "g4",
-      "question": "What chunk size and overlap are used when splitting document text?",
-      "expected_output": "Document text is split into chunks of 500 characters with an overlap of 100 characters.",
-      "expected_facts": ["500", "100", "overlap"]
+      "question": "What BLEU scores did the big Transformer model achieve on the WMT 2014 English-to-German and English-to-French translation tasks?",
+      "expected_output": "The big Transformer achieved a BLEU score of 28.4 on WMT 2014 English-to-German and 41.8 on WMT 2014 English-to-French.",
+      "expected_facts": ["28.4", "41.8", "BLEU"]
+    },
+    {
+      "id": "g5",
+      "question": "Which optimizer and hyperparameters were used to train the models?",
+      "expected_output": "The models were trained with the Adam optimizer using beta1 = 0.9, beta2 = 0.98, and epsilon = 10^-9, with a learning rate varied over the course of training.",
+      "expected_facts": ["Adam", "0.9", "0.98"]
     }
   ]
 }

@@ -14,9 +14,10 @@ through unchanged.
 from __future__ import annotations
 
 import logging
+import threading
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .config import SETTINGS
 
@@ -46,19 +47,27 @@ class LLMGateway:
     enable_cache: bool = SETTINGS.gateway_cache
     call_log: List[CallRecord] = field(default_factory=list)
     _configured: bool = False
+    # Guards call_log and the one-time _configure(). Under FastAPI, each sync
+    # endpoint runs in a worker thread, so concurrent /ask calls append here while
+    # /gateway/summary iterates it; without this lock a summary read can raise
+    # "list changed size during iteration" or read a torn total.
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def _configure(self) -> None:
         if self._configured:
             return
-        import litellm
+        with self._lock:
+            if self._configured:  # another thread may have configured while we waited
+                return
+            import litellm
 
-        litellm.suppress_debug_info = True
-        litellm.drop_params = True  # ignore params a given provider does not support
-        if self.enable_cache:
-            from litellm.caching import Cache
+            litellm.suppress_debug_info = True
+            litellm.drop_params = True  # ignore params a given provider does not support
+            if self.enable_cache:
+                from litellm.caching import Cache
 
-            litellm.cache = Cache(type="local")
-        self._configured = True
+                litellm.cache = Cache(type="local")
+            self._configured = True
 
     def complete(
         self,
@@ -69,10 +78,39 @@ class LLMGateway:
         max_tokens: Optional[int] = None,
         use_fallbacks: bool = True,
     ) -> str:
-        """Run one completion through the gateway and return the text.
+        """Run one completion through the gateway and return only the text.
 
-        Records model served, tokens, latency, and USD cost in call_log.
-        Fallbacks rescue the call transparently if the primary model fails.
+        Thin wrapper over complete_verbose for callers that do not need the
+        per-call record.
+        """
+        text, _record = self.complete_verbose(
+            messages,
+            model=model,
+            tag=tag,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            use_fallbacks=use_fallbacks,
+        )
+        return text
+
+    def complete_verbose(
+        self,
+        messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
+        tag: str = "anonymous",
+        temperature: float = 0.0,
+        max_tokens: Optional[int] = None,
+        use_fallbacks: bool = True,
+    ) -> Tuple[str, CallRecord]:
+        """Run one completion and return (text, this call's CallRecord).
+
+        Returning the record inline lets a caller read the model served for THIS
+        call without indexing call_log[-1], which is unsafe under concurrency: a
+        different thread may append its own record between this call finishing and
+        the caller reading the list.
+
+        Records model served, tokens, latency, and USD cost in call_log (under
+        the lock). Fallbacks rescue the call transparently if the primary fails.
         """
         import time
 
@@ -114,29 +152,38 @@ class LLMGateway:
             cached=bool(getattr(resp, "_hidden_params", {}).get("cache_hit", False)),
             tag=tag,
         )
-        self.call_log.append(record)
-        return resp.choices[0].message.content or ""
+        with self._lock:
+            self.call_log.append(record)
+        return resp.choices[0].message.content or "", record
 
     # --- observability helpers --------------------------------------------
     def total_cost(self) -> float:
-        return round(sum(r.cost_usd for r in self.call_log), 8)
+        with self._lock:
+            return round(sum(r.cost_usd for r in self.call_log), 8)
 
     def summary(self) -> Dict[str, Any]:
+        # Snapshot under the lock so a concurrent append cannot change the list
+        # mid-iteration; compute the aggregates off the snapshot.
+        with self._lock:
+            records = list(self.call_log)
         return {
-            "calls": len(self.call_log),
-            "total_cost_usd": self.total_cost(),
-            "total_prompt_tokens": sum(r.prompt_tokens for r in self.call_log),
-            "total_completion_tokens": sum(r.completion_tokens for r in self.call_log),
-            "models_served": sorted({r.model_served for r in self.call_log}),
+            "calls": len(records),
+            "total_cost_usd": round(sum(r.cost_usd for r in records), 8),
+            "total_prompt_tokens": sum(r.prompt_tokens for r in records),
+            "total_completion_tokens": sum(r.completion_tokens for r in records),
+            "models_served": sorted({r.model_served for r in records}),
         }
 
 
 # One shared gateway for the process.
 _GATEWAY: Optional[LLMGateway] = None
+_GATEWAY_LOCK = threading.Lock()
 
 
 def get_gateway() -> LLMGateway:
     global _GATEWAY
     if _GATEWAY is None:
-        _GATEWAY = LLMGateway()
+        with _GATEWAY_LOCK:
+            if _GATEWAY is None:  # double-checked: only one gateway per process
+                _GATEWAY = LLMGateway()
     return _GATEWAY

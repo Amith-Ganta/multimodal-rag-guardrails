@@ -45,6 +45,42 @@ appears in the verbose log.
 If no fallback judge is configured, or the fallback also fails, we raise a clear,
 typed error so the metric fails visibly and honestly, rather than letting an
 opaque teardown AttributeError take the whole gate down with it.
+
+A second, distinct ceiling: GEval's raw-response path
+-------------------------------------------------------
+GEval (used here for the "Correctness" metric) does not go through the schema
+API above. For a judge that supports log probs -- true for gpt-4o-mini --
+DeepEval's GEval calls ``generate_raw_response``/``a_generate_raw_response``
+instead, which hits the plain ``client.chat.completions.create(...)`` endpoint
+and then parses ``choices[0].message.content`` itself with
+``trimAndLoadJson``. Unlike ``.parse()``, plain ``.create()`` does NOT raise on
+a length overrun: it silently returns a truncated string with
+``finish_reason == "length"``. A truncated GEval verdict is typically cut off
+mid-string (e.g. mid-``reason``), which is a genuinely incomplete JSON object,
+not just a bad escape -- ``json_repair_patch.py``'s escape repair cannot fix a
+missing closing quote/brace, so the original "invalid JSON" error still
+surfaces.
+
+``generate_raw_response``/``a_generate_raw_response`` are overridden below to
+apply the same two-stage recovery: on a detected ``finish_reason == "length"``,
+retry once compactly (shorter reason) on the same model, then fall back to the
+larger-output judge if that still truncates. This mirrors the schema-path fix
+exactly, just triggered by the raw completion's own ``finish_reason`` instead
+of a raised exception (raw calls never raise for this).
+
+The fallback judge cannot always take the raw-path delegation, though: the
+default fallback (Groq ``openai/gpt-oss-120b``) has no entry in DeepEval's
+``OPENAI_MODELS_DATA`` table, so its ``model_data`` carries an unknown
+``supports_log_probs`` (``None``, not ``True``) -- it was only ever built for
+the schema path above (``generate``/``a_generate``, which never consult
+``model_data``). Delegating the raw path to it would either be refused by
+DeepEval's own ``generate_raw_response`` guard or (on a version where that
+guard is less defensive) risk an opaque crash instead of an honest failure.
+So the raw-path override checks ``supports_log_probs()`` defensively --
+treating anything other than a confirmed ``True`` (including an exception) as
+"cannot" -- before delegating, and returns the (still truncated) original
+response otherwise. ``trimAndLoadJson`` then raises its normal, honest error,
+exactly as it did before this fix, and no score is ever fabricated.
 """
 
 from __future__ import annotations
@@ -67,6 +103,16 @@ _COMPACT_INSTRUCTION = (
     "Return ONLY the verdict for each claim (yes / no / idk). Leave every "
     "reason field empty or omit it entirely. Do not add any explanation, "
     "preamble, or commentary. Keep the JSON as short as possible."
+)
+
+# Same idea, worded for GEval's single {"score": ..., "reason": ...} object
+# rather than a list of per-claim verdicts.
+_COMPACT_RAW_INSTRUCTION = (
+    "\n\nIMPORTANT: Your previous response was too long and was truncated. "
+    "Return ONLY the JSON object with the numeric score field. Keep the "
+    "reason field to a single short sentence (under 15 words). Do not add "
+    "any explanation, preamble, or commentary. Keep the JSON as short as "
+    "possible so it fits well within the output limit."
 )
 
 
@@ -185,3 +231,75 @@ class RobustOpenAIModel(OpenAIModel):
                     prompt, schema=schema
                 )
                 return result
+
+    @staticmethod
+    def _raw_finish_reason(res) -> str | None:
+        try:
+            return res.choices[0].finish_reason
+        except Exception:  # noqa: BLE001 - be defensive about SDK shape drift
+            return None
+
+    def _fallback_supports_raw(self) -> bool:
+        """Whether the fallback judge can safely take the raw-response path.
+
+        The default fallback (Groq ``openai/gpt-oss-120b``) has no entry in
+        DeepEval's ``OPENAI_MODELS_DATA`` table, so its own
+        ``supports_log_probs()`` does an unguarded ``self.model_data.xxx``
+        attribute access on ``None`` and raises ``AttributeError`` -- not the
+        graceful ``False`` the check is meant to produce. Calling
+        ``generate_raw_response`` on such a judge would crash instead of
+        degrading, so probe defensively and treat any failure as "cannot".
+        """
+        if self._fallback_judge is None:
+            return False
+        try:
+            return bool(self._fallback_judge.supports_log_probs())
+        except Exception:  # noqa: BLE001 - unknown model_data, treat as unsupported
+            return False
+
+    def generate_raw_response(self, prompt, top_logprobs: int = 5):
+        res, cost = super().generate_raw_response(prompt, top_logprobs=top_logprobs)
+        if self._raw_finish_reason(res) != "length":
+            return res, cost
+
+        compact = _augment_prompt(prompt, _COMPACT_RAW_INSTRUCTION)
+        res2, cost2 = super().generate_raw_response(
+            compact, top_logprobs=top_logprobs
+        )
+        if self._raw_finish_reason(res2) != "length":
+            return res2, cost + cost2
+
+        if not self._fallback_supports_raw():
+            # No fallback configured, or it cannot take the raw-response path
+            # safely: return the (still truncated) original response.
+            # trimAndLoadJson will raise its normal, honest error -- we never
+            # fabricate a score here, and never let an unrelated AttributeError
+            # take the gate down instead.
+            return res, cost
+
+        res3, cost3 = self._fallback_judge.generate_raw_response(
+            prompt, top_logprobs=top_logprobs
+        )
+        return res3, cost + cost2 + cost3
+
+    async def a_generate_raw_response(self, prompt, top_logprobs: int = 5):
+        res, cost = await super().a_generate_raw_response(
+            prompt, top_logprobs=top_logprobs
+        )
+        if self._raw_finish_reason(res) != "length":
+            return res, cost
+
+        compact = _augment_prompt(prompt, _COMPACT_RAW_INSTRUCTION)
+        res2, cost2 = await super().a_generate_raw_response(
+            compact, top_logprobs=top_logprobs
+        )
+        if self._raw_finish_reason(res2) != "length":
+            return res2, cost + cost2
+
+        if not self._fallback_supports_raw():
+            return res, cost
+
+        res3, cost3 = await self._fallback_judge.a_generate_raw_response(
+            prompt, top_logprobs=top_logprobs
+        )
+        return res3, cost + cost2 + cost3

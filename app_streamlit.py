@@ -29,10 +29,23 @@ st.set_page_config(page_title="Multimodal RAG", layout="wide")
 
 @st.cache_resource(show_spinner=True)
 def _load_index():
-    """Load the saved sample index once per session."""
+    """Load the saved sample index once per session.
+
+    A missing index is the expected first-run case and returns None quietly so
+    the page prompts for an upload. Any other failure (a partial or corrupt
+    index, a faiss or pickle read error) also returns None but surfaces the
+    reason, so a broken sample index degrades to "upload a PDF" instead of
+    crashing the whole page.
+    """
     try:
         return MultimodalIndex.load()
     except FileNotFoundError:
+        return None
+    except Exception as exc:  # noqa: BLE001 - a bad index must not crash the UI
+        st.warning(
+            f"The saved sample index could not be loaded ({exc}). "
+            "Upload a PDF to build a fresh one."
+        )
         return None
 
 
@@ -84,8 +97,8 @@ def _show_image(index: MultimodalIndex, image_id: str) -> None:
 st.title("Multimodal RAG: dual-encoder, guardrails, A2A")
 st.caption(
     "Text via a dedicated text encoder, images via CLIP, two separate indexes. "
-    "Answers run behind NeMo input/output rails. The sample document is "
-    "synthetic; its numbers are illustrative."
+    "Answers run behind NeMo input/output rails. The default document is the "
+    "paper \"Attention Is All You Need\"; upload your own PDF to replace it."
 )
 
 sample_index = _load_index()
@@ -95,7 +108,7 @@ with st.sidebar:
     st.caption(
         "Upload a PDF that mixes text and images. Both are indexed: text through "
         "the text encoder, page images through CLIP. Your upload replaces the "
-        "sample for this session and is not stored on the server."
+        "default document for this session and is not stored on the server."
     )
     uploaded = st.file_uploader("Upload a PDF", type=["pdf"])
     if uploaded is not None:
@@ -125,7 +138,7 @@ with st.sidebar:
                     "the pages are images of text that this build does not OCR."
                 )
     if st.session_state.get("_uploaded_index") is not None:
-        if st.button("Clear upload, use sample"):
+        if st.button("Clear upload, use default"):
             st.session_state.pop("_uploaded_index", None)
             st.session_state.pop("_uploaded_sig", None)
             st.rerun()
@@ -149,7 +162,7 @@ if index is None:
 active_label = (
     "your uploaded PDF"
     if st.session_state.get("_uploaded_index") is not None
-    else "the synthetic sample document"
+    else "the default paper (Attention Is All You Need)"
 )
 st.caption(f"Answering from: **{active_label}**.")
 

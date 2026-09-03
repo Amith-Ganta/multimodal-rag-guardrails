@@ -106,6 +106,9 @@ def answer_query(
         context = retrieve(index, query)
     messages = build_vision_messages(query, index, context)
     gateway = get_gateway()
-    text = gateway.complete(messages, tag=tag)
-    served = gateway.call_log[-1].model_served if gateway.call_log else None
-    return Answer(question=query, text=text, context=context, model_served=served)
+    # Read the served model from THIS call's record, not call_log[-1]: under
+    # concurrent requests another thread may append between the call and the read.
+    text, record = gateway.complete_verbose(messages, tag=tag)
+    return Answer(
+        question=query, text=text, context=context, model_served=record.model_served
+    )

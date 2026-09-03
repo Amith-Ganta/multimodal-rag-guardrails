@@ -16,6 +16,7 @@ Run:
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -26,12 +27,23 @@ from .gateway import get_gateway
 
 app = FastAPI(title="Multimodal RAG (dual-encoder + guardrails + A2A)")
 
+_log = logging.getLogger("multimodal_rag.api")
+
 # Loaded at startup; None until an index exists on disk.
 _INDEX = None
 _GUARD = None
 
 
 def _load_index():
+    """Load the index and build the guarded pipeline once, at startup.
+
+    Any failure here (no index yet, a partial/corrupt index, a faiss or pickle
+    read error, or a GuardedRAG construction failure) leaves both globals None
+    and is logged rather than raised, so the process still starts and the ask
+    endpoints return a clean 503 instead of the whole service crashing on boot.
+    A missing index is the expected first-run case; anything else is logged with
+    a traceback so it is diagnosable.
+    """
     global _INDEX, _GUARD
     from .guard import GuardedRAG
     from .index import MultimodalIndex
@@ -42,6 +54,17 @@ def _load_index():
     except FileNotFoundError:
         _INDEX = None
         _GUARD = None
+        _log.warning(
+            "No index found on disk; /ask and /ask_a2a will return 503 until "
+            "one is built with scripts/build_index.py."
+        )
+    except Exception:  # noqa: BLE001 - startup must never hard-crash here
+        _INDEX = None
+        _GUARD = None
+        _log.exception(
+            "Failed to load the index or build the guarded pipeline at startup; "
+            "the service will start but the ask endpoints will return 503."
+        )
 
 
 @app.on_event("startup")
