@@ -83,16 +83,18 @@ jobs:
           docker save multimodal-rag-ui:ci multimodal-rag-api:ci -o /tmp/images.tar
 
       - name: Push images to ECR (same-repo main/PR only)
+        # ECR repos have tag immutability enabled (a deliberate DevSecOps
+        # control so a tag can never be silently swapped once pushed). A
+        # floating ":latest" tag is incompatible with that: the first push
+        # succeeds and every push after it is rejected. So push only the
+        # immutable commit-SHA tag; Helm and every deploy path already
+        # reference images by that SHA tag, never by ":latest".
         if: ${{ github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request' }}
         run: |
           docker tag multimodal-rag-ui:ci "${ECR_UI_REPO}:${{ steps.tags.outputs.sha_tag }}"
-          docker tag multimodal-rag-ui:ci "${ECR_UI_REPO}:latest"
           docker tag multimodal-rag-api:ci "${ECR_API_REPO}:${{ steps.tags.outputs.sha_tag }}"
-          docker tag multimodal-rag-api:ci "${ECR_API_REPO}:latest"
           docker push "${ECR_UI_REPO}:${{ steps.tags.outputs.sha_tag }}"
-          docker push "${ECR_UI_REPO}:latest"
           docker push "${ECR_API_REPO}:${{ steps.tags.outputs.sha_tag }}"
-          docker push "${ECR_API_REPO}:latest"
 
       - name: Upload image artifact
         uses: actions/upload-artifact@v4
