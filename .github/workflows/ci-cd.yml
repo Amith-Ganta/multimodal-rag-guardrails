@@ -274,6 +274,19 @@ jobs:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
       PYTHONPATH: ${{ github.workspace }}
+      # The judge (evals/robust_judge.py) already paces itself via
+      # EVAL_JUDGE_MAX_CONCURRENCY/EVAL_JUDGE_MIN_INTERVAL_SECONDS below, but
+      # `deepeval test run` also drives this app's OWN answer-generation calls
+      # (one per golden, through src/gateway.py's LLMGateway) concurrently with
+      # the judge calls, on the SAME OpenAI org TPM budget. Left unthrottled,
+      # that second call path alone was enough to sustain 200000/200000 TPM
+      # and fail the gate even though the judge's own pacing looked healthy.
+      # Off by default in src/config.py (0 = unlimited) so production traffic
+      # is never gated; only this CI job opts in.
+      GATEWAY_MAX_CONCURRENCY: "2"
+      GATEWAY_MIN_INTERVAL_SECONDS: "2.0"
+      EVAL_JUDGE_MAX_CONCURRENCY: "3"
+      EVAL_JUDGE_MIN_INTERVAL_SECONDS: "1.5"
     steps:
       - uses: actions/checkout@v4
 

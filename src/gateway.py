@@ -14,7 +14,9 @@ through unchanged.
 from __future__ import annotations
 
 import logging
+import re
 import threading
+import time
 import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -28,6 +30,65 @@ from .config import SETTINGS
 warnings.filterwarnings("ignore", module=r"litellm.*")
 warnings.filterwarnings("ignore", module=r"pydantic.*")
 logging.getLogger("LiteLLM").setLevel(logging.ERROR)
+
+
+# --- optional pacing for answer-generation calls ----------------------------
+# Mirrors evals/robust_judge.py's judge-side throttle. Off by default (limit=0
+# / interval=0) so normal API/production traffic is never gated; the eval gate
+# turns this on via GATEWAY_MAX_CONCURRENCY / GATEWAY_MIN_INTERVAL_SECONDS
+# because it drives many concurrent answer-generation calls (one per golden)
+# on the SAME OpenAI org TPM budget the judge is already pacing itself against.
+# Without this, the two independently-throttled call paths still collide on
+# one shared TPM pool -- confirmed in CI via sustained 200000/200000 TPM 429s
+# from LiteLLM's fallback chain while the judge's own pacing looked healthy.
+_GATEWAY_SEMAPHORE: Optional[threading.Semaphore] = None
+_GATEWAY_SEMAPHORE_LOCK = threading.Lock()
+_GATEWAY_RATE_LOCK = threading.Lock()
+_GATEWAY_LAST_CALL_AT = 0.0
+
+_RETRY_AFTER_RE = re.compile(r"try again in ([\d.]+)(ms|s)", re.IGNORECASE)
+_GATEWAY_RATE_LIMIT_MAX_RETRIES = 3
+_GATEWAY_RATE_LIMIT_FALLBACK_WAIT_SECONDS = 2.0
+
+
+def _gateway_semaphore() -> Optional[threading.Semaphore]:
+    global _GATEWAY_SEMAPHORE
+    limit = SETTINGS.gateway_max_concurrency
+    if limit <= 0:
+        return None
+    if _GATEWAY_SEMAPHORE is None:
+        with _GATEWAY_SEMAPHORE_LOCK:
+            if _GATEWAY_SEMAPHORE is None:
+                _GATEWAY_SEMAPHORE = threading.Semaphore(limit)
+    return _GATEWAY_SEMAPHORE
+
+
+def _gateway_throttle() -> None:
+    min_interval = SETTINGS.gateway_min_interval_seconds
+    if min_interval <= 0:
+        return
+    global _GATEWAY_LAST_CALL_AT
+    with _GATEWAY_RATE_LOCK:
+        wait = _GATEWAY_LAST_CALL_AT + min_interval - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        _GATEWAY_LAST_CALL_AT = time.time()
+
+
+def _is_gateway_rate_limit_error(exc: Exception) -> bool:
+    name = exc.__class__.__name__
+    if name == "RateLimitError":
+        return True
+    return "RateLimitError" in name or "rate_limit" in str(exc).lower()
+
+
+def _gateway_rate_limit_wait_seconds(exc: Exception) -> float:
+    match = _RETRY_AFTER_RE.search(str(exc))
+    if not match:
+        return _GATEWAY_RATE_LIMIT_FALLBACK_WAIT_SECONDS
+    value, unit = match.groups()
+    seconds = float(value) / 1000.0 if unit.lower() == "ms" else float(value)
+    return min(max(seconds, 0.05) * 1.2, 30.0)
 
 
 @dataclass
@@ -136,8 +197,27 @@ class LLMGateway:
         if use_fallbacks and self.fallbacks:
             kwargs["fallbacks"] = list(self.fallbacks)
 
+        def _do_call():
+            _gateway_throttle()
+            last_exc: Optional[Exception] = None
+            for attempt in range(_GATEWAY_RATE_LIMIT_MAX_RETRIES + 1):
+                try:
+                    return completion(**kwargs)
+                except Exception as exc:  # noqa: BLE001 - re-raised below if not a 429
+                    if not _is_gateway_rate_limit_error(exc):
+                        raise
+                    last_exc = exc
+                    if attempt < _GATEWAY_RATE_LIMIT_MAX_RETRIES:
+                        time.sleep(_gateway_rate_limit_wait_seconds(exc))
+            raise last_exc
+
         start = time.time()
-        resp = completion(**kwargs)
+        semaphore = _gateway_semaphore()
+        if semaphore is not None:
+            with semaphore:
+                resp = _do_call()
+        else:
+            resp = _do_call()
         latency = time.time() - start
 
         try:

@@ -126,6 +126,18 @@ class Settings:
     eval_judge_min_interval_seconds: float = float(
         os.getenv("EVAL_JUDGE_MIN_INTERVAL_SECONDS", "1.5")
     )
+    # The eval gate also drives the app's OWN answer-generation calls (one per
+    # golden, through LLMGateway below) concurrently with the judge calls above.
+    # Both draw on the same OpenAI org's TPM budget, and until now only the
+    # judge side was paced -- observed in CI as sustained 200000/200000 TPM 429s
+    # from LiteLLM's fallback chain (gpt-4o-mini) while the judge's own
+    # semaphore/throttle looked completely healthy. These two settings give the
+    # gateway the same kind of cap, off by default (0 means "no limit") so normal
+    # API/production traffic is never throttled unless a deployment opts in.
+    gateway_max_concurrency: int = int(os.getenv("GATEWAY_MAX_CONCURRENCY", "0"))
+    gateway_min_interval_seconds: float = float(
+        os.getenv("GATEWAY_MIN_INTERVAL_SECONDS", "0")
+    )
 
     # --- Answer verification guard loop (DeepEval runtime) -----------------
     verify_answers: bool = _get_bool("VERIFY_ANSWERS", False)
