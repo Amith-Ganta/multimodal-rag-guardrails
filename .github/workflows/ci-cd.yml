@@ -283,10 +283,18 @@ jobs:
       # and fail the gate even though the judge's own pacing looked healthy.
       # Off by default in src/config.py (0 = unlimited) so production traffic
       # is never gated; only this CI job opts in.
-      GATEWAY_MAX_CONCURRENCY: "2"
-      GATEWAY_MIN_INTERVAL_SECONDS: "2.0"
-      EVAL_JUDGE_MAX_CONCURRENCY: "3"
-      EVAL_JUDGE_MIN_INTERVAL_SECONDS: "1.5"
+      # Tightened again after CI run 33974699593 still hit sustained
+      # 200000/200000 TPM 429s with the previous values (2/2.0s gateway,
+      # 3/1.5s judge) - the log showed each rejected call only needed
+      # ~858-881ms more spacing to clear, but that was measured with BOTH
+      # call paths bursting independently against the same shared budget at
+      # once. Serializing them (gateway to 1-at-a-time) removes that overlap
+      # instead of just narrowing it, which is why gateway concurrency drops
+      # to 1 rather than being tuned further as a second independent knob.
+      GATEWAY_MAX_CONCURRENCY: "1"
+      GATEWAY_MIN_INTERVAL_SECONDS: "3.0"
+      EVAL_JUDGE_MAX_CONCURRENCY: "2"
+      EVAL_JUDGE_MIN_INTERVAL_SECONDS: "2.5"
     steps:
       - uses: actions/checkout@v4
 
