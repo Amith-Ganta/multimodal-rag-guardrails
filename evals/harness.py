@@ -49,11 +49,12 @@ _JUDGE_MAX_TOKENS = 16384
 def _judge():
     """Length-robust judge shared with every gate (name-string fallback)."""
     try:
-        from evals.robust_judge import RobustOpenAIModel
+        from evals.robust_judge import RobustOpenAIModel, primary_judge_kwargs
 
         return RobustOpenAIModel(
             model=SETTINGS.eval_judge_model,
             generation_kwargs={"max_tokens": _JUDGE_MAX_TOKENS},
+            **primary_judge_kwargs(),
         )
     except Exception:
         return SETTINGS.eval_judge_model

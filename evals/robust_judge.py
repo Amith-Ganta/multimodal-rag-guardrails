@@ -287,6 +287,31 @@ def _augment_prompt(prompt, extra: str):
     return prompt
 
 
+def primary_judge_kwargs() -> dict:
+    """Extra kwargs to route the PRIMARY judge off OpenAI, or {} to use the
+    OpenAIModel default (OpenAI, keyed by OPENAI_API_KEY) unchanged.
+
+    Reads the base URL and key-env-var name from SETTINGS, exactly like
+    ``build_fallback_judge`` does for the fallback judge. Only returns non-empty
+    kwargs when both ``eval_judge_key_env`` is set AND that environment variable
+    actually holds a key -- so leaving the new settings unset (local dev, other
+    CI jobs) reproduces today's OpenAI-only behaviour exactly.
+    """
+    try:
+        from src.config import SETTINGS
+    except Exception:
+        return {}
+
+    key_env = SETTINGS.eval_judge_key_env
+    if not key_env:
+        return {}
+    api_key = os.getenv(key_env)
+    if not api_key:
+        return {}
+
+    return {"base_url": SETTINGS.eval_judge_base_url, "api_key": api_key}
+
+
 def build_fallback_judge():
     """Build the larger-output fallback judge, or return None if unconfigured.
 

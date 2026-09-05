@@ -86,11 +86,12 @@ def _judge():
     on import.
     """
     try:
-        from evals.robust_judge import RobustOpenAIModel
+        from evals.robust_judge import RobustOpenAIModel, primary_judge_kwargs
 
         return RobustOpenAIModel(
             model=JUDGE_MODEL,
             generation_kwargs={"max_tokens": _JUDGE_MAX_TOKENS},
+            **primary_judge_kwargs(),
         )
     except Exception:
         return JUDGE_MODEL

@@ -78,11 +78,12 @@ PII_THRESHOLD = 0.9
 def _judge():
     """Length-robust judge, matching the other gates."""
     try:
-        from evals.robust_judge import RobustOpenAIModel
+        from evals.robust_judge import RobustOpenAIModel, primary_judge_kwargs
 
         return RobustOpenAIModel(
             model=JUDGE_MODEL,
             generation_kwargs={"max_tokens": 16384},
+            **primary_judge_kwargs(),
         )
     except Exception:
         return JUDGE_MODEL

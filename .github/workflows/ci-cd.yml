@@ -274,6 +274,23 @@ jobs:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
       PYTHONPATH: ${{ github.workspace }}
+      # Route the PRIMARY judge (evals/robust_judge.py's RobustOpenAIModel, via
+      # src/config.py's eval_judge_base_url/eval_judge_key_env) off OpenAI
+      # entirely and onto DeepSeek's OpenAI-compatible endpoint. The judge fires
+      # on every metric for every golden/probe - the dominant share of this
+      # job's OpenAI-side call volume - and it shares the same org's 200k TPM
+      # budget with the app's own answer-generation calls below. Four
+      # consecutive runs still hit sustained 200000/200000 TPM 429s after three
+      # rounds of throttle tightening (see GATEWAY_*/EVAL_JUDGE_* below), which
+      # only pace calls within that shared budget rather than shrinking it.
+      # Moving the judge to DeepSeek removes its contribution to that budget
+      # instead of just re-timing it. OPENAI_API_KEY stays required above: it
+      # still backs the app's own LLMGateway answer-generation path, which this
+      # change does not touch.
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      EVAL_JUDGE_MODEL: deepseek-chat
+      EVAL_JUDGE_BASE_URL: https://api.deepseek.com
+      EVAL_JUDGE_KEY_ENV: DEEPSEEK_API_KEY
       # The judge (evals/robust_judge.py) already paces itself via
       # EVAL_JUDGE_MAX_CONCURRENCY/EVAL_JUDGE_MIN_INTERVAL_SECONDS below, but
       # `deepeval test run` also drives this app's OWN answer-generation calls

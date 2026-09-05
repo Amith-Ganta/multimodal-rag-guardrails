@@ -68,11 +68,12 @@ def _judge():
     """Length-robust judge, matching the answer gate. Falls back to the plain
     model-name string if the model class is unavailable in this build."""
     try:
-        from evals.robust_judge import RobustOpenAIModel
+        from evals.robust_judge import RobustOpenAIModel, primary_judge_kwargs
 
         return RobustOpenAIModel(
             model=JUDGE_MODEL,
             generation_kwargs={"max_tokens": 16384},
+            **primary_judge_kwargs(),
         )
     except Exception:
         return JUDGE_MODEL

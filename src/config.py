@@ -88,6 +88,15 @@ class Settings:
 
     # --- Eval gate ---------------------------------------------------------
     eval_judge_model: str = os.getenv("EVAL_JUDGE_MODEL", "gpt-4o-mini")
+    # Optional: point the PRIMARY judge at a non-OpenAI, OpenAI-compatible
+    # endpoint (e.g. DeepSeek) instead of OpenAI. Both empty (the default)
+    # means "use OpenAIModel's own default routing" -- i.e. OpenAI, keyed by
+    # OPENAI_API_KEY, exactly as before this pair of settings existed. This
+    # exists to take the primary judge's call volume (fired for every metric
+    # on every golden -- the dominant share of CI's judge traffic) off the
+    # OpenAI org's shared TPM budget entirely, rather than pacing it further.
+    eval_judge_base_url: str = os.getenv("EVAL_JUDGE_BASE_URL", "")
+    eval_judge_key_env: str = os.getenv("EVAL_JUDGE_KEY_ENV", "")
     eval_threshold: float = float(os.getenv("EVAL_THRESHOLD", "0.7"))
     # Fallback judge for the rare golden whose structured verdict list makes the
     # primary judge (gpt-4o-mini) loop up to its 16384-token output ceiling. This
