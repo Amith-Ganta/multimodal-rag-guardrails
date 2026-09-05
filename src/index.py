@@ -45,28 +45,74 @@ _STOPWORDS = frozenset(
 # the space) but has no real content, so it must never win a rerank.
 _DEGENERATE_TOKEN_RE = re.compile(r"<\s*(pad|eos|bos|unk|s|/s)\s*>", re.IGNORECASE)
 
+# The appendix figure pages (Figures 3-5) are attention-visualisation plots: a
+# short caption sitting on top of a long strip of raw tokenizer output
+# ("... <EOS> <pad> <pad> ..."). Two of those chunks carry only one or two
+# <pad> markers after the caption, so a flat ">= 3 hits" rule lets them through
+# and they then outrank real prose on any "attention"-flavoured query. Score the
+# DENSITY of special tokens instead of the raw count: real prose is ~0% special
+# tokens, a visualisation strip is several percent, regardless of length.
+_DEGENERATE_TOKEN_RATIO = 0.02
+
 
 def _is_degenerate_chunk(text: str) -> bool:
-    hits = _DEGENERATE_TOKEN_RE.findall(text)
-    return len(hits) >= 3
+    """True when a chunk is mostly tokenizer artefacts rather than readable prose.
+
+    Such a chunk can still land a high raw cosine score (padding embeds near the
+    mean of the space) while carrying no answerable content, so it must never
+    win a rerank.
+    """
+    hits = len(_DEGENERATE_TOKEN_RE.findall(text))
+    if hits >= 3:
+        return True
+    words = len(_WORD_RE.findall(text.lower())) or 1
+    return hits > 0 and (hits / words) >= _DEGENERATE_TOKEN_RATIO
+
+
+# Terms that describe the shape of a question rather than its subject. They
+# survive the stopword filter but match nearly every chunk in a research paper
+# ("used", "models", "train", "paper"), so counting them makes the lexical score
+# saturate: on "Which optimizer and hyperparameters were used to train the
+# models?" the chunk about code availability scored the SAME as the chunk that
+# names Adam. Down-weighting them lets the discriminative terms decide.
+_LOW_SALIENCE = frozenset(
+    """
+    used use using paper models model train trained training illustrate
+    illustrates show shows shown describe describes described mechanism
+    method methods approach result results work
+    """.split()
+)
+
+# Weight a rare, on-topic term this many times more than a generic one.
+_SALIENT_WEIGHT = 3.0
 
 
 def _keyword_overlap(query: str, text: str) -> float:
-    """Fraction of the query's distinct, non-stopword keywords that appear in text.
+    """Weighted fraction of the query's keywords that appear in text.
 
     The bi-encoder embeds for semantic similarity, so a chunk that's
     topically adjacent but doesn't mention the query's specific named
     entities (e.g. "Figure 2", "optimizer") can outrank the chunk that
     actually answers the question. This lexical signal corrects for that
-    without needing a second model. Stopwords are excluded because they
-    match nearly every chunk and would otherwise dilute the signal down to
-    noise.
+    without needing a second model.
+
+    Matches are weighted, not counted. An unweighted count treats "optimizer"
+    and "used" as equally informative, which flattens the signal to a constant
+    across candidates and makes the rerank a no-op (or worse: it ranked the
+    true Adam/beta/epsilon chunk BELOW three irrelevant ones, because that
+    chunk happens to omit the filler words the others share).
     """
     query_words = set(_WORD_RE.findall(query.lower())) - _STOPWORDS
     if not query_words:
         return 0.0
     text_words = set(_WORD_RE.findall(text.lower())) - _STOPWORDS
-    return len(query_words & text_words) / len(query_words)
+
+    def weight(word: str) -> float:
+        return 1.0 if word in _LOW_SALIENCE else _SALIENT_WEIGHT
+
+    total = sum(weight(w) for w in query_words)
+    matched = sum(weight(w) for w in query_words & text_words)
+    return matched / total if total else 0.0
 
 
 @dataclass
@@ -151,9 +197,14 @@ class MultimodalIndex:
             return []
 
         def combined(hit: TextHit) -> float:
-            # Cosine similarity is in [-1, 1]; keyword overlap in [0, 1] scaled
-            # down so it nudges ranking rather than overriding semantic score.
-            return hit.score + 0.2 * _keyword_overlap(query, hit.chunk.text)
+            # Cosine similarity is in [-1, 1]; keyword overlap in [0, 1].
+            # At the old 0.2 weight the lexical term spanned at most 0.2 while
+            # observed cosine gaps between the right chunk and a wrong one ran
+            # to ~0.15-0.2, so a decisive lexical match still could not move a
+            # chunk past a merely topical one. 0.35 lets an exact match on the
+            # query's salient terms overturn a modest embedding deficit while
+            # still leaving cosine the dominant term.
+            return hit.score + 0.35 * _keyword_overlap(query, hit.chunk.text)
 
         candidates.sort(key=combined, reverse=True)
         return candidates[:k]
