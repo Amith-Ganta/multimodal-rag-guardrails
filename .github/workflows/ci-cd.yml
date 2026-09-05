@@ -181,6 +181,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify provider API keys are valid (status codes only, never the key)
+        run: |
+          openai_status=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            https://api.openai.com/v1/models)
+          echo "OpenAI /v1/models auth check: HTTP $openai_status"
+          groq_status=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $GROQ_API_KEY" \
+            https://api.groq.com/openai/v1/models)
+          echo "Groq /v1/models auth check: HTTP $groq_status"
+          fail=0
+          if [ "$openai_status" != "200" ]; then
+            echo "::error::OPENAI_API_KEY failed auth (HTTP $openai_status) - the secret value is invalid/expired."
+            fail=1
+          fi
+          if [ "$groq_status" != "200" ]; then
+            echo "::error::GROQ_API_KEY failed auth (HTTP $groq_status) - the secret value is invalid/expired."
+            fail=1
+          fi
+          exit $fail
+
       - name: Download image artifact
         uses: actions/download-artifact@v4
         with:

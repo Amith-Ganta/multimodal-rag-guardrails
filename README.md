@@ -256,7 +256,7 @@ PYTHONUTF8=1 PYTHONIOENCODING=utf-8 NO_COLOR=1 TERM=dumb COLUMNS=200 deepeval te
 |---|---|---|
 | `TEXT_ENCODER_BACKEND` | `minilm` | `minilm` (local) or `openai` (API-based embeddings) |
 | `VISION_MODEL` | `gpt-4o-mini` | primary answering model |
-| `GATEWAY_FALLBACKS` | `gpt-4o,groq/llama-3.3-70b-versatile` | ordered fallback chain if the primary model fails or times out |
+| `GATEWAY_FALLBACKS` | `gpt-4o,groq/openai/gpt-oss-120b` | ordered fallback chain if the primary model fails or times out |
 | `GATEWAY_CACHE` | `true` | cache identical gateway requests |
 | `GATEWAY_TIMEOUT_SEC` | `60` | per-call wall-clock cap before falling back |
 | `GUARDRAILS_ENABLED` | `true` | toggle NeMo Guardrails input/output rails |

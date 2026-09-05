@@ -61,7 +61,7 @@ class Settings:
         default_factory=lambda: tuple(
             m.strip()
             for m in os.getenv(
-                "GATEWAY_FALLBACKS", "gpt-4o,groq/llama-3.3-70b-versatile"
+                "GATEWAY_FALLBACKS", "gpt-4o,groq/openai/gpt-oss-120b"
             ).split(",")
             if m.strip()
         )
