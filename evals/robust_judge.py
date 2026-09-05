@@ -87,14 +87,71 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import threading
+import time
 
 from deepeval.models import OpenAIModel
 
 try:  # openai is a hard dependency of the OpenAIModel judge; import defensively
-    from openai import LengthFinishReasonError
+    from openai import LengthFinishReasonError, RateLimitError
 except Exception:  # pragma: no cover - only if the SDK layout changes
     LengthFinishReasonError = None  # type: ignore[assignment]
+    RateLimitError = None  # type: ignore[assignment]
+
+# OpenAI's 429 body includes a hint like "Please try again in 858ms" -- when
+# present, that's a far better backoff than a fixed guess, since it reflects
+# the org's actual TPM refill schedule.
+_RETRY_AFTER_RE = re.compile(r"try again in ([\d.]+)(ms|s)", re.IGNORECASE)
+
+_RATE_LIMIT_MAX_RETRIES = 3
+_RATE_LIMIT_FALLBACK_WAIT_SECONDS = 2.0
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    if RateLimitError is not None and isinstance(exc, RateLimitError):
+        return True
+    return exc.__class__.__name__ == "RateLimitError"
+
+
+def _rate_limit_wait_seconds(exc: Exception) -> float:
+    match = _RETRY_AFTER_RE.search(str(exc))
+    if not match:
+        return _RATE_LIMIT_FALLBACK_WAIT_SECONDS
+    value, unit = match.groups()
+    seconds = float(value) / 1000.0 if unit.lower() == "ms" else float(value)
+    # A little headroom on top of OpenAI's own estimate, capped so a bad
+    # parse can't stall the suite.
+    return min(max(seconds, 0.05) * 1.2, 30.0)
+
+
+def _call_with_rate_limit_retry(fn):
+    """Retry ``fn`` a few times, backing off per OpenAI's suggested wait, on 429s."""
+    last_exc = None
+    for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001
+            if not _is_rate_limit_error(exc):
+                raise
+            last_exc = exc
+            if attempt < _RATE_LIMIT_MAX_RETRIES:
+                time.sleep(_rate_limit_wait_seconds(exc))
+    raise last_exc
+
+
+async def _call_with_rate_limit_retry_async(fn):
+    last_exc = None
+    for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
+        try:
+            return await fn()
+        except Exception as exc:  # noqa: BLE001
+            if not _is_rate_limit_error(exc):
+                raise
+            last_exc = exc
+            if attempt < _RATE_LIMIT_MAX_RETRIES:
+                await asyncio.sleep(_rate_limit_wait_seconds(exc))
+    raise last_exc
 
 
 def _max_concurrency() -> int:
@@ -104,6 +161,15 @@ def _max_concurrency() -> int:
         return max(1, SETTINGS.eval_judge_max_concurrency)
     except Exception:
         return 3
+
+
+def _min_interval_seconds() -> float:
+    try:
+        from src.config import SETTINGS
+
+        return max(0.0, SETTINGS.eval_judge_min_interval_seconds)
+    except Exception:
+        return 1.5
 
 
 # Process-wide caps, not per-instance: DeepEval's parametrized test cases each
@@ -132,6 +198,60 @@ def _async_judge_semaphore() -> asyncio.Semaphore:
         _ASYNC_JUDGE_SEMAPHORE = asyncio.Semaphore(_max_concurrency())
         _ASYNC_JUDGE_SEMAPHORE_LOOP = loop
     return _ASYNC_JUDGE_SEMAPHORE
+
+
+# Concurrency and rate are orthogonal: capping how many calls run at once does
+# NOT cap how many tokens land in a rolling 60s window, which is what OpenAI's
+# TPM limit actually measures. Observed in CI: with concurrency capped at 3,
+# the gate still hit "tokens per min (TPM): Limit 200000, Used 200000" over
+# and over, because 3 concurrent ~3000-token calls refill their slot the
+# instant one finishes -- nothing spaces them out in time. This second gate
+# enforces a minimum wall-clock interval between judge calls, sitting
+# alongside (not instead of) the semaphore above, so raising concurrency and
+# raising the pacing interval are two independent knobs instead of one
+# silently defeating the other.
+_SYNC_RATE_LOCK = threading.Lock()
+_SYNC_LAST_CALL_AT = 0.0
+
+_ASYNC_RATE_LOCK: asyncio.Lock | None = None
+_ASYNC_RATE_LOCK_LOOP: asyncio.AbstractEventLoop | None = None
+_ASYNC_LAST_CALL_AT = 0.0
+
+
+def _throttle_sync() -> None:
+    global _SYNC_LAST_CALL_AT
+    min_interval = _min_interval_seconds()
+    if min_interval <= 0:
+        return
+    with _SYNC_RATE_LOCK:
+        now = time.monotonic()
+        wait = _SYNC_LAST_CALL_AT + min_interval - now
+        if wait > 0:
+            time.sleep(wait)
+        _SYNC_LAST_CALL_AT = time.monotonic()
+
+
+def _async_rate_lock() -> asyncio.Lock:
+    """Same rebuild-on-loop-change pattern as ``_async_judge_semaphore``."""
+    global _ASYNC_RATE_LOCK, _ASYNC_RATE_LOCK_LOOP
+    loop = asyncio.get_event_loop()
+    if _ASYNC_RATE_LOCK is None or _ASYNC_RATE_LOCK_LOOP is not loop:
+        _ASYNC_RATE_LOCK = asyncio.Lock()
+        _ASYNC_RATE_LOCK_LOOP = loop
+    return _ASYNC_RATE_LOCK
+
+
+async def _throttle_async() -> None:
+    global _ASYNC_LAST_CALL_AT
+    min_interval = _min_interval_seconds()
+    if min_interval <= 0:
+        return
+    async with _async_rate_lock():
+        now = time.monotonic()
+        wait = _ASYNC_LAST_CALL_AT + min_interval - now
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _ASYNC_LAST_CALL_AT = time.monotonic()
 
 
 # Appended to the judge prompt on a length-overrun retry. It asks for the
@@ -232,16 +352,38 @@ class RobustOpenAIModel(OpenAIModel):
             "this golden."
         )
 
+    def _paced_call(self, fn):
+        def call():
+            _throttle_sync()
+            return fn()
+
+        return _call_with_rate_limit_retry(call)
+
+    async def _paced_call_async(self, fn):
+        async def call():
+            await _throttle_async()
+            return await fn()
+
+        return await _call_with_rate_limit_retry_async(call)
+
     def generate(self, prompt, schema=None):
+        # super() is captured here, outside the lambdas below: a bare super()
+        # written *inside* a lambda has no self/__class__ of its own -- it
+        # raises "RuntimeError: super(): no arguments" at call time, since the
+        # lambda is its own nested scope. Binding it to a local first sidesteps
+        # that entirely.
+        sup = super()
         with _SYNC_JUDGE_SEMAPHORE:
             try:
-                return super().generate(prompt, schema=schema)
+                return self._paced_call(lambda: sup.generate(prompt, schema=schema))
             except Exception as exc:  # noqa: BLE001 - re-raised unless a length overrun
                 if schema is None or not self._is_length_error(exc):
                     raise
                 compact = _augment_prompt(prompt, _COMPACT_INSTRUCTION)
                 try:
-                    return super().generate(compact, schema=schema)
+                    return self._paced_call(
+                        lambda: sup.generate(compact, schema=schema)
+                    )
                 except Exception as exc2:  # noqa: BLE001
                     if not self._is_length_error(exc2):
                         raise
@@ -250,26 +392,33 @@ class RobustOpenAIModel(OpenAIModel):
                     # Delegate this one call to the larger-output judge. Use the
                     # original (reason-bearing) prompt: the fallback has the
                     # budget, so it can return full verdicts.
-                    result = self._fallback_judge.generate(prompt, schema=schema)
+                    result = self._paced_call(
+                        lambda: self._fallback_judge.generate(prompt, schema=schema)
+                    )
                     return result
 
     async def a_generate(self, prompt, schema=None):
+        sup = super()
         async with _async_judge_semaphore():
             try:
-                return await super().a_generate(prompt, schema=schema)
+                return await self._paced_call_async(
+                    lambda: sup.a_generate(prompt, schema=schema)
+                )
             except Exception as exc:  # noqa: BLE001
                 if schema is None or not self._is_length_error(exc):
                     raise
                 compact = _augment_prompt(prompt, _COMPACT_INSTRUCTION)
                 try:
-                    return await super().a_generate(compact, schema=schema)
+                    return await self._paced_call_async(
+                        lambda: sup.a_generate(compact, schema=schema)
+                    )
                 except Exception as exc2:  # noqa: BLE001
                     if not self._is_length_error(exc2):
                         raise
                     if self._fallback_judge is None:
                         raise self._ceiling_error(exc2) from exc2
-                    result = await self._fallback_judge.a_generate(
-                        prompt, schema=schema
+                    result = await self._paced_call_async(
+                        lambda: self._fallback_judge.a_generate(prompt, schema=schema)
                     )
                     return result
 
@@ -299,16 +448,23 @@ class RobustOpenAIModel(OpenAIModel):
             return False
 
     def generate_raw_response(self, prompt, top_logprobs: int = 5):
+        # See generate(): a bare super() inside a lambda has no __class__ of its
+        # own, so it must be captured here first and referenced via `sup`.
+        sup = super()
         with _SYNC_JUDGE_SEMAPHORE:
-            res, cost = super().generate_raw_response(
-                prompt, top_logprobs=top_logprobs
+            res, cost = self._paced_call(
+                lambda: sup.generate_raw_response(
+                    prompt, top_logprobs=top_logprobs
+                )
             )
             if self._raw_finish_reason(res) != "length":
                 return res, cost
 
             compact = _augment_prompt(prompt, _COMPACT_RAW_INSTRUCTION)
-            res2, cost2 = super().generate_raw_response(
-                compact, top_logprobs=top_logprobs
+            res2, cost2 = self._paced_call(
+                lambda: sup.generate_raw_response(
+                    compact, top_logprobs=top_logprobs
+                )
             )
             if self._raw_finish_reason(res2) != "length":
                 return res2, cost + cost2
@@ -321,22 +477,29 @@ class RobustOpenAIModel(OpenAIModel):
                 # AttributeError take the gate down instead.
                 return res, cost
 
-            res3, cost3 = self._fallback_judge.generate_raw_response(
-                prompt, top_logprobs=top_logprobs
+            res3, cost3 = self._paced_call(
+                lambda: self._fallback_judge.generate_raw_response(
+                    prompt, top_logprobs=top_logprobs
+                )
             )
             return res3, cost + cost2 + cost3
 
     async def a_generate_raw_response(self, prompt, top_logprobs: int = 5):
+        sup = super()
         async with _async_judge_semaphore():
-            res, cost = await super().a_generate_raw_response(
-                prompt, top_logprobs=top_logprobs
+            res, cost = await self._paced_call_async(
+                lambda: sup.a_generate_raw_response(
+                    prompt, top_logprobs=top_logprobs
+                )
             )
             if self._raw_finish_reason(res) != "length":
                 return res, cost
 
             compact = _augment_prompt(prompt, _COMPACT_RAW_INSTRUCTION)
-            res2, cost2 = await super().a_generate_raw_response(
-                compact, top_logprobs=top_logprobs
+            res2, cost2 = await self._paced_call_async(
+                lambda: sup.a_generate_raw_response(
+                    compact, top_logprobs=top_logprobs
+                )
             )
             if self._raw_finish_reason(res2) != "length":
                 return res2, cost + cost2
@@ -344,7 +507,9 @@ class RobustOpenAIModel(OpenAIModel):
             if not self._fallback_supports_raw():
                 return res, cost
 
-            res3, cost3 = await self._fallback_judge.a_generate_raw_response(
-                prompt, top_logprobs=top_logprobs
+            res3, cost3 = await self._paced_call_async(
+                lambda: self._fallback_judge.a_generate_raw_response(
+                    prompt, top_logprobs=top_logprobs
+                )
             )
             return res3, cost + cost2 + cost3

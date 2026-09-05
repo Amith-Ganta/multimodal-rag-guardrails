@@ -117,6 +117,15 @@ class Settings:
     eval_judge_max_concurrency: int = int(
         os.getenv("EVAL_JUDGE_MAX_CONCURRENCY", "3")
     )
+    # Concurrency alone does not bound TPM: 3 concurrent ~3000-token calls can
+    # still land inside the same 60s window and blow a 200k TPM budget (observed
+    # in CI even with the concurrency cap above in place). This paces judge
+    # calls a minimum number of seconds apart, independent of how many are
+    # allowed to run at once, so the two knobs compose instead of one silently
+    # undermining the other.
+    eval_judge_min_interval_seconds: float = float(
+        os.getenv("EVAL_JUDGE_MIN_INTERVAL_SECONDS", "1.5")
+    )
 
     # --- Answer verification guard loop (DeepEval runtime) -----------------
     verify_answers: bool = _get_bool("VERIFY_ANSWERS", False)
