@@ -26,20 +26,46 @@ from .ingest import IngestResult, TextChunk, load_pil_images
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
 
+# Common words carry no discriminative signal: nearly every chunk in an English
+# document contains "the", "in", "does", etc., so without this filter every
+# candidate gets roughly the same overlap score and the rerank can't tell a
+# relevant chunk from an unrelated one.
+_STOPWORDS = frozenset(
+    """
+    a an the this that these those is are was were be been being
+    of to in on at for with from by as and or but not no nor
+    it its it's what which who whom does do did doing have has had
+    can could will would shall should may might must about into
+    over under above below between out up down than then so if
+    """.split()
+)
+
+# A chunk made up mostly of tokenizer padding/special tokens is degenerate:
+# it can still land a high raw cosine score (padding embeds near the mean of
+# the space) but has no real content, so it must never win a rerank.
+_DEGENERATE_TOKEN_RE = re.compile(r"<\s*(pad|eos|bos|unk|s|/s)\s*>", re.IGNORECASE)
+
+
+def _is_degenerate_chunk(text: str) -> bool:
+    hits = _DEGENERATE_TOKEN_RE.findall(text)
+    return len(hits) >= 3
+
 
 def _keyword_overlap(query: str, text: str) -> float:
-    """Fraction of the query's distinct keywords that appear in text.
+    """Fraction of the query's distinct, non-stopword keywords that appear in text.
 
     The bi-encoder embeds for semantic similarity, so a chunk that's
     topically adjacent but doesn't mention the query's specific named
     entities (e.g. "Figure 2", "optimizer") can outrank the chunk that
     actually answers the question. This lexical signal corrects for that
-    without needing a second model.
+    without needing a second model. Stopwords are excluded because they
+    match nearly every chunk and would otherwise dilute the signal down to
+    noise.
     """
-    query_words = set(_WORD_RE.findall(query.lower()))
+    query_words = set(_WORD_RE.findall(query.lower())) - _STOPWORDS
     if not query_words:
         return 0.0
-    text_words = set(_WORD_RE.findall(text.lower()))
+    text_words = set(_WORD_RE.findall(text.lower())) - _STOPWORDS
     return len(query_words & text_words) / len(query_words)
 
 
@@ -117,7 +143,10 @@ class MultimodalIndex:
         for score, idx in zip(scores[0], idxs[0]):
             if idx < 0:
                 continue
-            candidates.append(TextHit(chunk=self.text_payloads[idx], score=float(score)))
+            chunk = self.text_payloads[idx]
+            if _is_degenerate_chunk(chunk.text):
+                continue
+            candidates.append(TextHit(chunk=chunk, score=float(score)))
         if not candidates:
             return []
 
