@@ -85,7 +85,9 @@ exactly as it did before this fix, and no score is ever fabricated.
 
 from __future__ import annotations
 
+import asyncio
 import os
+import threading
 
 from deepeval.models import OpenAIModel
 
@@ -93,6 +95,43 @@ try:  # openai is a hard dependency of the OpenAIModel judge; import defensively
     from openai import LengthFinishReasonError
 except Exception:  # pragma: no cover - only if the SDK layout changes
     LengthFinishReasonError = None  # type: ignore[assignment]
+
+
+def _max_concurrency() -> int:
+    try:
+        from src.config import SETTINGS
+
+        return max(1, SETTINGS.eval_judge_max_concurrency)
+    except Exception:
+        return 3
+
+
+# Process-wide caps, not per-instance: DeepEval's parametrized test cases each
+# build their own RobustOpenAIModel, so the limit has to live above any single
+# instance to actually bound how many judge HTTP calls run at once across the
+# whole suite. This is what stops the ~9-way concurrent burst that tripped the
+# gpt-4o-mini org's tokens-per-minute limit in CI (see module docstring).
+_SYNC_JUDGE_SEMAPHORE = threading.Semaphore(_max_concurrency())
+_ASYNC_JUDGE_SEMAPHORE: asyncio.Semaphore | None = None
+_ASYNC_JUDGE_SEMAPHORE_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def _async_judge_semaphore() -> asyncio.Semaphore:
+    """Return the shared async semaphore, rebuilding it if the event loop changed.
+
+    An ``asyncio.Semaphore`` is bound to the loop it was created on. DeepEval's
+    ``assert_test`` runs each parametrized test case via ``asyncio.run``, which
+    creates a fresh loop per test, so a semaphore built once at import time
+    would raise ``RuntimeError`` (or silently stop limiting) on every test after
+    the first. Rebuilding it lazily when the running loop differs keeps one
+    live semaphore per loop while still capping concurrency within each.
+    """
+    global _ASYNC_JUDGE_SEMAPHORE, _ASYNC_JUDGE_SEMAPHORE_LOOP
+    loop = asyncio.get_event_loop()
+    if _ASYNC_JUDGE_SEMAPHORE is None or _ASYNC_JUDGE_SEMAPHORE_LOOP is not loop:
+        _ASYNC_JUDGE_SEMAPHORE = asyncio.Semaphore(_max_concurrency())
+        _ASYNC_JUDGE_SEMAPHORE_LOOP = loop
+    return _ASYNC_JUDGE_SEMAPHORE
 
 
 # Appended to the judge prompt on a length-overrun retry. It asks for the
@@ -194,43 +233,45 @@ class RobustOpenAIModel(OpenAIModel):
         )
 
     def generate(self, prompt, schema=None):
-        try:
-            return super().generate(prompt, schema=schema)
-        except Exception as exc:  # noqa: BLE001 - re-raised unless a length overrun
-            if schema is None or not self._is_length_error(exc):
-                raise
-            compact = _augment_prompt(prompt, _COMPACT_INSTRUCTION)
+        with _SYNC_JUDGE_SEMAPHORE:
             try:
-                return super().generate(compact, schema=schema)
-            except Exception as exc2:  # noqa: BLE001
-                if not self._is_length_error(exc2):
+                return super().generate(prompt, schema=schema)
+            except Exception as exc:  # noqa: BLE001 - re-raised unless a length overrun
+                if schema is None or not self._is_length_error(exc):
                     raise
-                if self._fallback_judge is None:
-                    raise self._ceiling_error(exc2) from exc2
-                # Delegate this one call to the larger-output judge. Use the
-                # original (reason-bearing) prompt: the fallback has the budget,
-                # so it can return full verdicts.
-                result = self._fallback_judge.generate(prompt, schema=schema)
-                return result
+                compact = _augment_prompt(prompt, _COMPACT_INSTRUCTION)
+                try:
+                    return super().generate(compact, schema=schema)
+                except Exception as exc2:  # noqa: BLE001
+                    if not self._is_length_error(exc2):
+                        raise
+                    if self._fallback_judge is None:
+                        raise self._ceiling_error(exc2) from exc2
+                    # Delegate this one call to the larger-output judge. Use the
+                    # original (reason-bearing) prompt: the fallback has the
+                    # budget, so it can return full verdicts.
+                    result = self._fallback_judge.generate(prompt, schema=schema)
+                    return result
 
     async def a_generate(self, prompt, schema=None):
-        try:
-            return await super().a_generate(prompt, schema=schema)
-        except Exception as exc:  # noqa: BLE001
-            if schema is None or not self._is_length_error(exc):
-                raise
-            compact = _augment_prompt(prompt, _COMPACT_INSTRUCTION)
+        async with _async_judge_semaphore():
             try:
-                return await super().a_generate(compact, schema=schema)
-            except Exception as exc2:  # noqa: BLE001
-                if not self._is_length_error(exc2):
+                return await super().a_generate(prompt, schema=schema)
+            except Exception as exc:  # noqa: BLE001
+                if schema is None or not self._is_length_error(exc):
                     raise
-                if self._fallback_judge is None:
-                    raise self._ceiling_error(exc2) from exc2
-                result = await self._fallback_judge.a_generate(
-                    prompt, schema=schema
-                )
-                return result
+                compact = _augment_prompt(prompt, _COMPACT_INSTRUCTION)
+                try:
+                    return await super().a_generate(compact, schema=schema)
+                except Exception as exc2:  # noqa: BLE001
+                    if not self._is_length_error(exc2):
+                        raise
+                    if self._fallback_judge is None:
+                        raise self._ceiling_error(exc2) from exc2
+                    result = await self._fallback_judge.a_generate(
+                        prompt, schema=schema
+                    )
+                    return result
 
     @staticmethod
     def _raw_finish_reason(res) -> str | None:
@@ -258,48 +299,52 @@ class RobustOpenAIModel(OpenAIModel):
             return False
 
     def generate_raw_response(self, prompt, top_logprobs: int = 5):
-        res, cost = super().generate_raw_response(prompt, top_logprobs=top_logprobs)
-        if self._raw_finish_reason(res) != "length":
-            return res, cost
+        with _SYNC_JUDGE_SEMAPHORE:
+            res, cost = super().generate_raw_response(
+                prompt, top_logprobs=top_logprobs
+            )
+            if self._raw_finish_reason(res) != "length":
+                return res, cost
 
-        compact = _augment_prompt(prompt, _COMPACT_RAW_INSTRUCTION)
-        res2, cost2 = super().generate_raw_response(
-            compact, top_logprobs=top_logprobs
-        )
-        if self._raw_finish_reason(res2) != "length":
-            return res2, cost + cost2
+            compact = _augment_prompt(prompt, _COMPACT_RAW_INSTRUCTION)
+            res2, cost2 = super().generate_raw_response(
+                compact, top_logprobs=top_logprobs
+            )
+            if self._raw_finish_reason(res2) != "length":
+                return res2, cost + cost2
 
-        if not self._fallback_supports_raw():
-            # No fallback configured, or it cannot take the raw-response path
-            # safely: return the (still truncated) original response.
-            # trimAndLoadJson will raise its normal, honest error -- we never
-            # fabricate a score here, and never let an unrelated AttributeError
-            # take the gate down instead.
-            return res, cost
+            if not self._fallback_supports_raw():
+                # No fallback configured, or it cannot take the raw-response
+                # path safely: return the (still truncated) original response.
+                # trimAndLoadJson will raise its normal, honest error -- we
+                # never fabricate a score here, and never let an unrelated
+                # AttributeError take the gate down instead.
+                return res, cost
 
-        res3, cost3 = self._fallback_judge.generate_raw_response(
-            prompt, top_logprobs=top_logprobs
-        )
-        return res3, cost + cost2 + cost3
+            res3, cost3 = self._fallback_judge.generate_raw_response(
+                prompt, top_logprobs=top_logprobs
+            )
+            return res3, cost + cost2 + cost3
 
     async def a_generate_raw_response(self, prompt, top_logprobs: int = 5):
-        res, cost = await super().a_generate_raw_response(
-            prompt, top_logprobs=top_logprobs
-        )
-        if self._raw_finish_reason(res) != "length":
-            return res, cost
+        async with _async_judge_semaphore():
+            res, cost = await super().a_generate_raw_response(
+                prompt, top_logprobs=top_logprobs
+            )
+            if self._raw_finish_reason(res) != "length":
+                return res, cost
 
-        compact = _augment_prompt(prompt, _COMPACT_RAW_INSTRUCTION)
-        res2, cost2 = await super().a_generate_raw_response(
-            compact, top_logprobs=top_logprobs
-        )
-        if self._raw_finish_reason(res2) != "length":
-            return res2, cost + cost2
+            compact = _augment_prompt(prompt, _COMPACT_RAW_INSTRUCTION)
+            res2, cost2 = await super().a_generate_raw_response(
+                compact, top_logprobs=top_logprobs
+            )
+            if self._raw_finish_reason(res2) != "length":
+                return res2, cost + cost2
 
-        if not self._fallback_supports_raw():
-            return res, cost
+            if not self._fallback_supports_raw():
+                return res, cost
 
-        res3, cost3 = await self._fallback_judge.a_generate_raw_response(
-            prompt, top_logprobs=top_logprobs
-        )
-        return res3, cost + cost2 + cost3
+            res3, cost3 = await self._fallback_judge.a_generate_raw_response(
+                prompt, top_logprobs=top_logprobs
+            )
+            return res3, cost + cost2 + cost3

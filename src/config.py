@@ -108,6 +108,15 @@ class Settings:
     eval_fallback_judge_key_env: str = os.getenv(
         "EVAL_FALLBACK_JUDGE_KEY_ENV", "GROQ_API_KEY"
     )
+    # DeepEval's own test-run/parametrize execution fires many judge calls
+    # concurrently with no built-in cap, which can burst well past the judge
+    # org's tokens-per-minute limit (observed: 9+ simultaneous gpt-4o-mini
+    # calls tripping a 200k TPM 429 in CI). This caps how many judge calls
+    # RobustOpenAIModel lets run at once, independent of DeepEval's own
+    # concurrency, so raising it back up is a config change, not a code change.
+    eval_judge_max_concurrency: int = int(
+        os.getenv("EVAL_JUDGE_MAX_CONCURRENCY", "3")
+    )
 
     # --- Answer verification guard loop (DeepEval runtime) -----------------
     verify_answers: bool = _get_bool("VERIFY_ANSWERS", False)
