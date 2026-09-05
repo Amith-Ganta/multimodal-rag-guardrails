@@ -120,7 +120,7 @@ jobs:
         run: docker load -i /tmp/images.tar
 
       - name: Trivy scan - UI image (fail on HIGH/CRITICAL)
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: multimodal-rag-ui:ci
           severity: HIGH,CRITICAL
@@ -129,7 +129,7 @@ jobs:
           format: table
 
       - name: Trivy scan - API image (fail on HIGH/CRITICAL)
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: multimodal-rag-api:ci
           severity: HIGH,CRITICAL
@@ -138,7 +138,7 @@ jobs:
           format: table
 
       - name: Trivy scan - filesystem/dependencies (fail on HIGH/CRITICAL)
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -266,6 +266,7 @@ jobs:
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      PYTHONPATH: ${{ github.workspace }}
     steps:
       - uses: actions/checkout@v4
 
