@@ -28,6 +28,11 @@ uvicorn>=0.30.0
 # dev
 pytest>=9.1.1
 
+# Transitive build-tool deps flagged by Trivy's dependency scan (CVE-2026-23949,
+# CVE-2026-24049). Not used directly, but floored so pip resolves patched versions.
+jaraco.context>=6.1.0
+wheel>=0.46.2
+
 # Windows only: DeepEval caches each test run through portalocker, which needs a
 # real shared file lock. Without pywin32, portalocker falls back to msvcrt (no
 # shared lock), DeepEval's cache manager returns None, and every test fails at
