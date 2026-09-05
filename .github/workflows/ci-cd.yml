@@ -54,30 +54,24 @@ jobs:
           SHA_TAG="${GITHUB_SHA::12}"
           echo "sha_tag=$SHA_TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Build (and push on same-repo main/PR) UI image
+      - name: Build UI image (local only - never push the bare :ci tag)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
-          push: ${{ github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request' }}
-          tags: |
-            multimodal-rag-ui:ci
-            ${{ env.ECR_UI_REPO }}:${{ steps.tags.outputs.sha_tag }}
-            ${{ env.ECR_UI_REPO }}:latest
+          push: false
+          tags: multimodal-rag-ui:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
           outputs: type=docker,dest=/tmp/ui-image.tar
 
-      - name: Build (and push on same-repo main/PR) API image
+      - name: Build API image (local only - never push the bare :ci tag)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.api
-          push: ${{ github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request' }}
-          tags: |
-            multimodal-rag-api:ci
-            ${{ env.ECR_API_REPO }}:${{ steps.tags.outputs.sha_tag }}
-            ${{ env.ECR_API_REPO }}:latest
+          push: false
+          tags: multimodal-rag-api:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
           outputs: type=docker,dest=/tmp/api-image.tar
@@ -87,6 +81,18 @@ jobs:
           docker load -i /tmp/ui-image.tar
           docker load -i /tmp/api-image.tar
           docker save multimodal-rag-ui:ci multimodal-rag-api:ci -o /tmp/images.tar
+
+      - name: Push images to ECR (same-repo main/PR only)
+        if: ${{ github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request' }}
+        run: |
+          docker tag multimodal-rag-ui:ci "${ECR_UI_REPO}:${{ steps.tags.outputs.sha_tag }}"
+          docker tag multimodal-rag-ui:ci "${ECR_UI_REPO}:latest"
+          docker tag multimodal-rag-api:ci "${ECR_API_REPO}:${{ steps.tags.outputs.sha_tag }}"
+          docker tag multimodal-rag-api:ci "${ECR_API_REPO}:latest"
+          docker push "${ECR_UI_REPO}:${{ steps.tags.outputs.sha_tag }}"
+          docker push "${ECR_UI_REPO}:latest"
+          docker push "${ECR_API_REPO}:${{ steps.tags.outputs.sha_tag }}"
+          docker push "${ECR_API_REPO}:latest"
 
       - name: Upload image artifact
         uses: actions/upload-artifact@v4

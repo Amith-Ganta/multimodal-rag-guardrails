@@ -171,7 +171,13 @@ data "aws_iam_policy_document" "github_actions_assume" {
     condition {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_repo}:*"]
+      # GitHub appends internal numeric IDs to the owner and repo names in the
+      # OIDC "sub" claim for this account (e.g.
+      # "repo:Amith-Ganta@259720589/multimodal-rag-guardrails@1355225274:ref:...")
+      # instead of the plain "repo:owner/name:ref:..." format the docs describe.
+      # Confirmed via CloudTrail AccessDenied events on AssumeRoleWithWebIdentity.
+      # Wildcard both segments so the match tolerates the "@<id>" suffix.
+      values = ["repo:${split("/", var.github_repo)[0]}*/${split("/", var.github_repo)[1]}*:*"]
     }
   }
 }
