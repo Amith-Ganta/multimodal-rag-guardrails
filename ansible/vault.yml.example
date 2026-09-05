@@ -1,0 +1,11 @@
+# Copy to vault.yml and encrypt it before it ever touches disk unencrypted
+# in a real checkout:
+#   cp vault.yml.example vault.yml
+#   (edit in the real key values)
+#   ansible-vault encrypt vault.yml
+#
+# Never commit an unencrypted vault.yml. Only the .example (no real secrets)
+# belongs in git.
+
+vault_openai_api_key: "sk-..."
+vault_groq_api_key: "gsk_..."

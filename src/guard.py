@@ -114,6 +114,12 @@ class GuardedRAG:
         ans = answer_query(self.index, question, tag="unguarded-rag")
         return {"answer": ans.text, "blocked": False, "answer_obj": ans}
 
+    def _blocked_response(self) -> dict:
+        """Fail-closed counterpart to _answer_unguarded: used when guardrails
+        are enabled, guardrails_fail_closed is set, and the rails cannot run.
+        """
+        return {"answer": BLOCKED_MESSAGE, "blocked": True, "answer_obj": None}
+
     def ask(self, question: str) -> dict:
         """Return {'answer', 'blocked', 'answer_obj'}.
 
@@ -136,12 +142,19 @@ class GuardedRAG:
                 self._rails_unavailable = True
                 _log.warning(
                     "Guardrails are enabled but no OPENAI_API_KEY is set; the "
-                    "self-check rails cannot run. Answering UNGUARDED. Set a key "
-                    "to enable the input/output rails."
+                    "self-check rails cannot run. %s Set a key to enable the "
+                    "input/output rails.",
+                    "Blocking the call."
+                    if SETTINGS.guardrails_fail_closed
+                    else "Answering UNGUARDED.",
                 )
+            if SETTINGS.guardrails_fail_closed:
+                return self._blocked_response()
             return self._answer_unguarded(question)
 
         if self._rails_unavailable:
+            if SETTINGS.guardrails_fail_closed:
+                return self._blocked_response()
             return self._answer_unguarded(question)
 
         # Reset the per-request slot so `blocked` reflects only this call: if the
@@ -160,9 +173,13 @@ class GuardedRAG:
                 # failure.
                 self._rails_unavailable = True
                 _log.exception(
-                    "Guardrails failed to run; falling back to an UNGUARDED "
-                    "answer for this and subsequent calls."
+                    "Guardrails failed to run; %s for this and subsequent calls.",
+                    "blocking calls"
+                    if SETTINGS.guardrails_fail_closed
+                    else "falling back to an UNGUARDED answer",
                 )
+                if SETTINGS.guardrails_fail_closed:
+                    return self._blocked_response()
                 return self._answer_unguarded(question)
 
             last_answer = _CURRENT_ANSWER.get()

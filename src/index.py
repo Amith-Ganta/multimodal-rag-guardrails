@@ -6,14 +6,14 @@ different vector spaces.
 
 Both use inner-product search on L2-normalised vectors, so the score is cosine
 similarity in [-1, 1]. Payloads (chunk text, image ids) are kept in parallel
-Python lists and pickled next to the FAISS files so a rebuilt process can answer
-without re-embedding.
+Python lists and saved as JSON next to the FAISS files so a rebuilt process can
+answer without re-embedding.
 """
 
 from __future__ import annotations
 
-import pickle
-from dataclasses import dataclass
+import json
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import List, Tuple
 
@@ -131,10 +131,10 @@ class MultimodalIndex:
             faiss.write_index(self.text_index, str(directory / "text.faiss"))
         if self.image_index is not None:
             faiss.write_index(self.image_index, str(directory / "image.faiss"))
-        with open(directory / "payloads.pkl", "wb") as fh:
-            pickle.dump(
+        with open(directory / "payloads.json", "w", encoding="utf-8") as fh:
+            json.dump(
                 {
-                    "text_payloads": self.text_payloads,
+                    "text_payloads": [asdict(c) for c in self.text_payloads],
                     "image_ids": self.image_ids,
                     "image_meta": self.image_meta,
                     "image_store": self.image_store,
@@ -158,10 +158,10 @@ class MultimodalIndex:
             obj.text_index = faiss.read_index(str(text_path))
         if image_path.exists():
             obj.image_index = faiss.read_index(str(image_path))
-        with open(directory / "payloads.pkl", "rb") as fh:
-            data = pickle.load(fh)
-        obj.text_payloads = data["text_payloads"]
+        with open(directory / "payloads.json", "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        obj.text_payloads = [TextChunk(**c) for c in data["text_payloads"]]
         obj.image_ids = data["image_ids"]
-        obj.image_meta = data["image_meta"]
+        obj.image_meta = [tuple(m) for m in data["image_meta"]]
         obj.image_store = data["image_store"]
         return obj

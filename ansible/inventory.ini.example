@@ -1,0 +1,10 @@
+# Copy to inventory.ini and fill in (or generate with:
+#   terraform -chdir=../terraform output -raw public_ip
+# and substitute below). Never commit inventory.ini with a real IP/key path
+# if the repo is public; this project's repo is public on GitHub.
+
+[app]
+app-host ansible_host=YOUR.EC2.PUBLIC.IP ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/your-key.pem
+
+[app:vars]
+ansible_python_interpreter=/usr/bin/python3

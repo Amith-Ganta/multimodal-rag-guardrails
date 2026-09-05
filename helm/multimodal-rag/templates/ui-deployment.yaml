@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: multimodal-rag-ui
+  labels:
+    app: multimodal-rag-ui
+spec:
+  replicas: {{ .Values.ui.replicaCount }}
+  selector:
+    matchLabels:
+      app: multimodal-rag-ui
+  template:
+    metadata:
+      labels:
+        app: multimodal-rag-ui
+    spec:
+      containers:
+        - name: ui
+          image: "{{ .Values.image.ui.repository }}:{{ .Values.image.ui.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.ui.port }}
+          envFrom:
+            - configMapRef:
+                name: multimodal-rag-config
+            - secretRef:
+                name: multimodal-rag-secrets
+          resources:
+            {{- toYaml .Values.ui.resources | nindent 12 }}
+          livenessProbe:
+            {{- toYaml .Values.ui.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.ui.readinessProbe | nindent 12 }}

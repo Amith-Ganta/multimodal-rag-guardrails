@@ -1,0 +1,124 @@
+---
+# Configures a bare Ubuntu EC2 host (provisioned by ../terraform) into a
+# running multimodal-rag-guardrails deployment: Docker + Compose plugin,
+# the repo checked out, .env populated from Ansible Vault secrets, and the
+# two-service stack started via `docker compose up -d`.
+#
+# Run:
+#   ansible-playbook playbook.yml --ask-vault-pass
+# or, with a vault password file:
+#   ansible-playbook playbook.yml --vault-password-file .vault_pass
+
+- name: Deploy multimodal RAG guardrails stack
+  hosts: app
+  become: true
+  vars_files:
+    - vault.yml
+
+  vars:
+    app_dir: /opt/multimodal-rag
+    repo_url: https://github.com/Amith-Ganta/multimodal-rag-guardrails.git
+    repo_branch: main
+
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install prerequisite packages
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - git
+        state: present
+
+    - name: Create keyrings directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Add Docker's official GPG key
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: "0644"
+        force: false
+
+    - name: Add Docker apt repository
+      ansible.builtin.apt_repository:
+        repo: >-
+          deb [arch={{ (ansible_architecture == 'x86_64') | ternary('amd64', 'arm64') }}
+          signed-by=/etc/apt/keyrings/docker.asc]
+          https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+        state: present
+        filename: docker
+
+    - name: Install Docker Engine + Compose plugin
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: true
+
+    - name: Ensure docker service is running and enabled
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Add deploy user to the docker group
+      ansible.builtin.user:
+        name: "{{ ansible_user }}"
+        groups: docker
+        append: true
+
+    - name: Reset connection so docker group membership takes effect
+      ansible.builtin.meta: reset_connection
+
+    - name: Create app directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0755"
+
+    - name: Clone or update the application repo
+      ansible.builtin.git:
+        repo: "{{ repo_url }}"
+        dest: "{{ app_dir }}"
+        version: "{{ repo_branch }}"
+        force: false
+      become_user: "{{ ansible_user }}"
+
+    - name: Write .env from vaulted secrets
+      ansible.builtin.template:
+        src: templates/env.j2
+        dest: "{{ app_dir }}/.env"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0600"
+      notify: Restart stack
+
+    - name: Pull latest images (if using a registry) or build locally
+      community.docker.docker_compose_v2:
+        project_src: "{{ app_dir }}"
+        build: always
+        pull: missing
+        state: present
+      become_user: "{{ ansible_user }}"
+
+  handlers:
+    - name: Restart stack
+      community.docker.docker_compose_v2:
+        project_src: "{{ app_dir }}"
+        state: restarted
+      become_user: "{{ ansible_user }}"

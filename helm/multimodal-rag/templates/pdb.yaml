@@ -1,0 +1,21 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: multimodal-rag-api
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app: multimodal-rag-api
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: multimodal-rag-ui
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app: multimodal-rag-ui
+{{- end }}

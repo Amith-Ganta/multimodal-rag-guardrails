@@ -3,6 +3,10 @@
 deepeval>=4.2.0
 faiss-cpu>=1.8.0
 fastapi>=0.115.0
+# fastapi>=0.115.0's TestClient builds on starlette's httpx-based test client, which
+# dropped support for httpx<0.28's constructor shortcut. Floor httpx explicitly so a
+# fresh CI install can't silently resolve an old httpx that breaks tests/test_api.py.
+httpx>=0.28.0
 langchain-text-splitters>=1.1.2
 litellm>=1.44.0
 nemoguardrails>=0.24.0

@@ -21,8 +21,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .config import SETTINGS
 
-# Keep LiteLLM quiet; it is chatty on import and per call.
-warnings.filterwarnings("ignore")
+# Keep LiteLLM quiet; it is chatty on import and per call. Scoped to LiteLLM's
+# own modules (and pydantic, which it drives hard enough to emit deprecation
+# noise) rather than a blanket ignore, so warnings from this project's own
+# code are never silently swallowed.
+warnings.filterwarnings("ignore", module=r"litellm.*")
+warnings.filterwarnings("ignore", module=r"pydantic.*")
 logging.getLogger("LiteLLM").setLevel(logging.ERROR)
 
 

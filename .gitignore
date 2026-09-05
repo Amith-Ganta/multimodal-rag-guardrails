@@ -2,6 +2,8 @@
 .env
 .env.*
 !.env.example
+*.pem
+*.key
 
 # --- Python ---
 __pycache__/
@@ -24,3 +26,19 @@ venv/
 .DS_Store
 Thumbs.db
 .ipynb_checkpoints/
+
+# --- Terraform (applies recursively to every module, e.g. terraform/eks/) ---
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
+terraform.tfvars
+*.tfplan
+tfplan*.out
+terraform/deploy-secrets.txt
+
+# --- Ansible ---
+ansible/inventory.ini
+ansible/vault.yml
+ansible/.vault_pass
+ansible/*.retry

@@ -1,7 +1,7 @@
 """FastAPI surface for the multimodal RAG service.
 
 Endpoints:
-  GET  /health         -> liveness + whether an index and keys are present
+  GET  /health         -> liveness + whether an index is loaded
   POST /ask            -> guarded RAG answer (NeMo input/output rails)
   POST /ask_a2a        -> retriever/verifier agent-to-agent answer
   GET  /gateway/summary-> cost/token/model audit from the LLM gateway
@@ -100,9 +100,6 @@ def health() -> Dict[str, Any]:
         "status": "ok",
         "index_loaded": _INDEX is not None,
         "guardrails_enabled": SETTINGS.guardrails_enabled,
-        "has_openai_key": SETTINGS.has_openai_key,
-        "has_groq_key": SETTINGS.has_groq_key,
-        "vision_model": SETTINGS.vision_model,
     }
 
 

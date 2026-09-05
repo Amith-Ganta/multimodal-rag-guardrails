@@ -1,0 +1,371 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write   # required for GitHub OIDC -> AWS role assumption
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  # Set after `terraform apply` in terraform/eks/ via the github_actions_role_arn
+  # output. Not a secret - safe to keep as a repo variable, not a repo secret.
+  AWS_ROLE_ARN: ${{ vars.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+  ECR_UI_REPO: ${{ vars.ECR_UI_REPOSITORY_URL }}
+  ECR_API_REPO: ${{ vars.ECR_API_REPOSITORY_URL }}
+  # Set after `terraform apply` in terraform/eks/ via the cluster_name output.
+  # Left empty until then - the deploy-eks job self-skips (see its `if:`) so
+  # CI stays green on the EC2 path while the EKS cluster doesn't exist yet.
+  EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+
+jobs:
+  build:
+    name: Build Docker images
+    runs-on: ubuntu-latest
+    # Forked-repo PRs can't assume the OIDC role (no secrets/vars access), so
+    # they get a build-only smoke test with no push - this condition mirrors
+    # the eval-gate job's same-repo gating below.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials (OIDC, no static keys)
+        if: ${{ github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        if: ${{ github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request' }}
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          SHA_TAG="${GITHUB_SHA::12}"
+          echo "sha_tag=$SHA_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Build (and push on same-repo main/PR) UI image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: ${{ github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request' }}
+          tags: |
+            multimodal-rag-ui:ci
+            ${{ env.ECR_UI_REPO }}:${{ steps.tags.outputs.sha_tag }}
+            ${{ env.ECR_UI_REPO }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          outputs: type=docker,dest=/tmp/ui-image.tar
+
+      - name: Build (and push on same-repo main/PR) API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.api
+          push: ${{ github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request' }}
+          tags: |
+            multimodal-rag-api:ci
+            ${{ env.ECR_API_REPO }}:${{ steps.tags.outputs.sha_tag }}
+            ${{ env.ECR_API_REPO }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          outputs: type=docker,dest=/tmp/api-image.tar
+
+      - name: Save images for downstream jobs
+        run: |
+          docker load -i /tmp/ui-image.tar
+          docker load -i /tmp/api-image.tar
+          docker save multimodal-rag-ui:ci multimodal-rag-api:ci -o /tmp/images.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-images
+          path: /tmp/images.tar
+          retention-days: 1
+
+  security-scan:
+    name: DevSecOps - container + dependency scan
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+          path: /tmp
+
+      - name: Load images
+        run: docker load -i /tmp/images.tar
+
+      - name: Trivy scan - UI image (fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: multimodal-rag-ui:ci
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+          format: table
+
+      - name: Trivy scan - API image (fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: multimodal-rag-api:ci
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+          format: table
+
+      - name: Trivy scan - filesystem/dependencies (fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+          format: table
+
+      - name: Gitleaks secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  test:
+    name: Unit + integration tests
+    runs-on: ubuntu-latest
+    needs: build
+    env:
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit + integration tests
+        run: pytest tests/ -v --ignore=tests/test_e2e.py
+
+  e2e:
+    name: End-to-end tests (live API + UI flow)
+    runs-on: ubuntu-latest
+    needs: build
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+          path: /tmp
+
+      - name: Load images
+        run: docker load -i /tmp/images.tar
+
+      - name: Start API container
+        run: |
+          docker run -d --name e2e-api -p 8000:8000 \
+            -e OPENAI_API_KEY="$OPENAI_API_KEY" \
+            -e GROQ_API_KEY="$GROQ_API_KEY" \
+            multimodal-rag-api:ci
+
+      - name: Wait for API health
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8000/health; then exit 0; fi
+            sleep 5
+          done
+          echo "API did not become healthy in time" >&2
+          docker logs e2e-api
+          exit 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install test dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run end-to-end tests against the live container
+        env:
+          E2E_API_URL: http://localhost:8000
+        run: pytest tests/test_e2e.py -v
+
+      - name: Dump API logs on failure
+        if: failure()
+        run: docker logs e2e-api
+
+      - name: Tear down
+        if: always()
+        run: docker rm -f e2e-api || true
+
+  eval-gate:
+    name: DeepEval quality gate
+    runs-on: ubuntu-latest
+    needs: build
+    # This job only runs on pushes to main and same-repo PRs (never on forks,
+    # which don't have secrets access) - so unlike the test files' own
+    # pytestmark skipif, OPENAI_API_KEY is NOT optional here. The explicit
+    # check below turns a missing/misnamed secret into a failed build instead
+    # of three quietly-skipped DeepEval files that `deepeval test run` still
+    # reports as an overall pass (skip != fail in its exit code).
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request' }}
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Require OPENAI_API_KEY (eval gates must run, never silently skip)
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "::error::OPENAI_API_KEY secret is missing or empty. This job is gated to" \
+                 "same-repo pushes/PRs, so the key must be present - evals/test_leakage.py," \
+                 "evals/test_retriever.py and evals/test_multimodal_rag.py would each" \
+                 "self-skip via pytestmark and deepeval would still exit 0, giving a false" \
+                 "green build with zero safety assertions run. Failing the build instead."
+            exit 1
+          fi
+
+      - name: Build sample index for eval fixtures
+        run: |
+          python scripts/make_sample_pdf.py
+          python scripts/build_index.py
+
+      - name: Run DeepEval gates (fail on error AND on any silent skip)
+        run: |
+          set -o pipefail
+          deepeval test run evals/test_leakage.py evals/test_retriever.py evals/test_multimodal_rag.py \
+            2>&1 | tee /tmp/deepeval_output.txt
+          RUN_STATUS=$?
+          if grep -qiE "SKIPPED:" /tmp/deepeval_output.txt; then
+            echo "::error::One or more eval gate files printed their SKIPPED banner even" \
+                 "though OPENAI_API_KEY is set. A gate that skips is not a gate that passed -" \
+                 "investigate before merging (see evals/test_leakage.py etc. for the banner)."
+            exit 1
+          fi
+          exit $RUN_STATUS
+
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: [eval-gate, test, e2e, security-scan]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Deploy over SSH (git pull + docker compose up --build -d)
+        run: |
+          ssh -i ~/.ssh/deploy_key "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" '
+            set -e
+            cd /opt/multimodal-rag
+            git fetch origin main
+            git reset --hard origin/main
+            docker compose up --build -d
+            docker image prune -f
+          '
+
+      - name: Verify deployment health
+        run: |
+          for i in $(seq 1 10); do
+            if curl -fsS "http://${{ secrets.DEPLOY_HOST }}:8000/health"; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "API did not become healthy in time" >&2
+          exit 1
+
+  deploy-eks:
+    name: Deploy to EKS (Helm)
+    runs-on: ubuntu-latest
+    needs: [eval-gate, test, e2e, security-scan]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && vars.EKS_CLUSTER_NAME != ''
+    environment: production
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC, no static keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig for EKS cluster
+        run: aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.15.3
+
+      - name: Compute image tag
+        id: tags
+        run: echo "sha_tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Helm upgrade --install
+        run: |
+          helm upgrade --install multimodal-rag helm/multimodal-rag \
+            --set image.api.repository="$ECR_API_REPO" \
+            --set image.api.tag="${{ steps.tags.outputs.sha_tag }}" \
+            --set image.ui.repository="$ECR_UI_REPO" \
+            --set image.ui.tag="${{ steps.tags.outputs.sha_tag }}" \
+            --set secrets.openaiApiKey="$OPENAI_API_KEY" \
+            --set secrets.groqApiKey="$GROQ_API_KEY" \
+            --wait --timeout 5m
+
+      - name: Verify rollout status
+        run: |
+          kubectl rollout status deployment/multimodal-rag-api --timeout=180s
+          kubectl rollout status deployment/multimodal-rag-ui --timeout=180s
+
+      - name: Show pods and HPA state
+        if: always()
+        run: |
+          kubectl get pods -o wide
+          kubectl get hpa
+          kubectl get pdb

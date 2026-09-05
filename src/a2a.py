@@ -135,8 +135,10 @@ class VerifierAgent:
 def _parse_verdict(raw: str) -> tuple[Verdict, str, str]:
     """Parse the verifier's JSON reply defensively.
 
-    A malformed reply is treated as "accept" so a judge hiccup never blocks a
-    usable answer; the reason records that the parse failed.
+    A malformed reply is treated as "revise" so a judge hiccup never gets
+    silently rubber-stamped as accepted; the reason records that the parse
+    failed, and the retriever gets another round (or the caller sees
+    accepted=False once retries are exhausted).
     """
     text = (raw or "").strip()
     start, end = text.find("{"), text.rfind("}")
@@ -148,7 +150,7 @@ def _parse_verdict(raw: str) -> tuple[Verdict, str, str]:
             return verdict, str(obj.get("reason", "")), str(obj.get("feedback", ""))
         except (json.JSONDecodeError, ValueError):
             pass
-    return "accept", "verifier reply was not valid JSON; defaulting to accept", ""
+    return "revise", "verifier reply was not valid JSON; defaulting to revise", ""
 
 
 def run_a2a(index: MultimodalIndex, question: str) -> A2AResult:

@@ -47,10 +47,18 @@ from src.index import MultimodalIndex
 
 # --- guard: skip the whole module cleanly when the judge key is absent -------
 _HAS_KEY = bool(os.environ.get("OPENAI_API_KEY"))
-pytestmark = pytest.mark.skipif(
-    not _HAS_KEY,
-    reason="OPENAI_API_KEY not set; DeepEval judge (gpt-4o-mini) cannot run.",
-)
+_SKIP_REASON = "OPENAI_API_KEY not set; DeepEval judge (gpt-4o-mini) cannot run."
+pytestmark = pytest.mark.skipif(not _HAS_KEY, reason=_SKIP_REASON)
+
+if not _HAS_KEY:
+    # A skipif reason only shows up with -rs/-v. Left at defaults, this whole
+    # gate goes green with zero assertions run and nothing to say so - print a
+    # banner that shows up in plain `pytest`/`deepeval test run` output too.
+    print(
+        f"\n{'=' * 70}\n"
+        f"SKIPPED: evals/test_retriever.py - {_SKIP_REASON}\n"
+        f"No retrieval-quality assertions ran in this file.\n{'=' * 70}"
+    )
 
 JUDGE_MODEL = SETTINGS.eval_judge_model  # "gpt-4o-mini"
 THRESHOLD = SETTINGS.eval_threshold  # 0.7

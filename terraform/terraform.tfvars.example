@@ -1,0 +1,10 @@
+# Copy to terraform.tfvars and fill in. Never commit terraform.tfvars itself
+# (it's already in .gitignore below the project root's own entries).
+
+aws_region       = "us-east-1"
+project_name     = "multimodal-rag"
+instance_type    = "t3.large"
+ssh_key_name     = "your-existing-ec2-keypair-name"
+ssh_ingress_cidr = "YOUR.IP.ADDR.ESS/32"
+app_ingress_cidr = "0.0.0.0/0"
+allocate_eip     = true

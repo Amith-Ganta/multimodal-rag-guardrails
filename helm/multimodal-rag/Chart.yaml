@@ -1,0 +1,6 @@
+apiVersion: v2
+name: multimodal-rag
+description: Multimodal RAG guardrails service (Streamlit UI + FastAPI API) for the multimodal-rag-guardrails EKS deployment
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

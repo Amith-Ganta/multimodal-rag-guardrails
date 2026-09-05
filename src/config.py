@@ -74,6 +74,11 @@ class Settings:
     # --- Guardrails --------------------------------------------------------
     guardrails_enabled: bool = _get_bool("GUARDRAILS_ENABLED", True)
     guardrails_model: str = os.getenv("GUARDRAILS_MODEL", "gpt-4o-mini")
+    # When guardrails are enabled but cannot run (no judge key, or the rails
+    # fail to build/execute), the default is to answer UNGUARDED so the
+    # service stays usable. Set this to block instead of degrading, for
+    # deployments where an unguarded answer is worse than an error.
+    guardrails_fail_closed: bool = _get_bool("GUARDRAILS_FAIL_CLOSED", False)
 
     # --- Retrieval ---------------------------------------------------------
     text_chunk_size: int = int(os.getenv("TEXT_CHUNK_SIZE", "500"))
