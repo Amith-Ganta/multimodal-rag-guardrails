@@ -75,16 +75,38 @@ def _is_degenerate_chunk(text: str) -> bool:
 # saturate: on "Which optimizer and hyperparameters were used to train the
 # models?" the chunk about code availability scored the SAME as the chunk that
 # names Adam. Down-weighting them lets the discriminative terms decide.
+#
+# "hyperparameters"/"parameters"/"settings"/"configuration" belong in this same
+# bucket: they name the GENERAL category of thing a methodology section
+# discusses, so almost every training-setup chunk in a paper mentions one of
+# them, without saying WHICH hyperparameter. On the query above, the chunks
+# about beam search and GPU/step timing both contain the literal word
+# "hyperparameters" and so tied the Adam-optimizer chunk on keyword overlap
+# despite not naming an optimizer at all, while also winning on raw cosine
+# similarity -- letting two topically-adjacent-but-non-answering chunks outrank
+# the chunk that actually names Adam/beta/epsilon.
 _LOW_SALIENCE = frozenset(
     """
     used use using paper models model train trained training illustrate
     illustrates show shows shown describe describes described mechanism
     method methods approach result results work
+    hyperparameter hyperparameters parameter parameters setting settings
+    configuration configurations
     """.split()
 )
 
 # Weight a rare, on-topic term this many times more than a generic one.
-_SALIENT_WEIGHT = 3.0
+#
+# At 3.0, a query with only one truly salient word (e.g. "optimizer" in
+# "Which optimizer and hyperparameters were used to train the models?")
+# still lets a chunk that matches two low-salience words (e.g. "used" +
+# "hyperparameters") out-overlap the chunk containing that one salient word,
+# because 2 * 1.0 > 1 * 3.0. That let the beam-search chunk -- which never
+# names an optimizer -- keep a higher combined score than the Adam chunk.
+# 5.0 makes a single salient match worth more than any pair of generic ones
+# still possible under this vocabulary, so the chunk that actually names the
+# subject the query asks about wins the tie.
+_SALIENT_WEIGHT = 5.0
 
 
 def _keyword_overlap(query: str, text: str) -> float:
