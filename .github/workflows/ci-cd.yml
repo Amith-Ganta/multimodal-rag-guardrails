@@ -255,14 +255,21 @@ jobs:
   eval-gate:
     name: DeepEval quality gate
     runs-on: ubuntu-latest
-    needs: build
+    # Runs after e2e (not just build) even though it doesn't need e2e's
+    # artifacts. Both jobs make heavy gpt-4o-mini judge/guardrail calls
+    # against the SAME OpenAI org's shared TPM quota (200k tokens/min); run
+    # concurrently they exhaust it and both fail with cascading
+    # litellm/openai RateLimitError. Serializing them here trades a bit of
+    # wall-clock time for a pipeline that doesn't flake on shared-quota
+    # exhaustion.
+    needs: [build, e2e]
     # This job only runs on pushes to main and same-repo PRs (never on forks,
     # which don't have secrets access) - so unlike the test files' own
     # pytestmark skipif, OPENAI_API_KEY is NOT optional here. The explicit
     # check below turns a missing/misnamed secret into a failed build instead
     # of three quietly-skipped DeepEval files that `deepeval test run` still
     # reports as an overall pass (skip != fail in its exit code).
-    if: ${{ github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request' }}
+    if: ${{ always() && (github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request') }}
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}

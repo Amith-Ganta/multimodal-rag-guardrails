@@ -13,6 +13,7 @@ answer without re-embedding.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import List, Tuple
@@ -22,6 +23,24 @@ import numpy as np
 from .config import SETTINGS
 from .encoders import get_image_encoder, get_text_encoder
 from .ingest import IngestResult, TextChunk, load_pil_images
+
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _keyword_overlap(query: str, text: str) -> float:
+    """Fraction of the query's distinct keywords that appear in text.
+
+    The bi-encoder embeds for semantic similarity, so a chunk that's
+    topically adjacent but doesn't mention the query's specific named
+    entities (e.g. "Figure 2", "optimizer") can outrank the chunk that
+    actually answers the question. This lexical signal corrects for that
+    without needing a second model.
+    """
+    query_words = set(_WORD_RE.findall(query.lower()))
+    if not query_words:
+        return 0.0
+    text_words = set(_WORD_RE.findall(text.lower()))
+    return len(query_words & text_words) / len(query_words)
 
 
 @dataclass
@@ -89,13 +108,26 @@ class MultimodalIndex:
             return []
         k = k or SETTINGS.top_k_text
         qv = get_text_encoder().encode([query])
-        scores, idxs = self.text_index.search(qv, min(k, len(self.text_payloads)))
-        hits: List[TextHit] = []
+        # Over-fetch a wider candidate pool than we need so the keyword-overlap
+        # rerank below has room to pull up a lexically-exact match that the
+        # bi-encoder alone ranked outside the final top-k.
+        pool = min(k * 4, len(self.text_payloads))
+        scores, idxs = self.text_index.search(qv, pool)
+        candidates: List[TextHit] = []
         for score, idx in zip(scores[0], idxs[0]):
             if idx < 0:
                 continue
-            hits.append(TextHit(chunk=self.text_payloads[idx], score=float(score)))
-        return hits
+            candidates.append(TextHit(chunk=self.text_payloads[idx], score=float(score)))
+        if not candidates:
+            return []
+
+        def combined(hit: TextHit) -> float:
+            # Cosine similarity is in [-1, 1]; keyword overlap in [0, 1] scaled
+            # down so it nudges ranking rather than overriding semantic score.
+            return hit.score + 0.2 * _keyword_overlap(query, hit.chunk.text)
+
+        candidates.sort(key=combined, reverse=True)
+        return candidates[:k]
 
     def search_images(self, query: str, k: int | None = None) -> List[ImageHit]:
         """Cross-modal: a TEXT query retrieves images via CLIP's text tower."""

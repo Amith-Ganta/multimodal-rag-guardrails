@@ -19,6 +19,13 @@ RUN apt-get update \
 
 RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
+# The base image's preinstalled setuptools vendors its own old copy of
+# jaraco.context under setuptools/_vendor/, which Trivy flags (CVE-2026-23949)
+# independently of whatever jaraco.context version requirements.txt resolves
+# for the standalone package. Only upgrading setuptools itself replaces that
+# vendored copy.
+RUN pip install --no-cache-dir --upgrade "setuptools>=80.9.0"
+
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
