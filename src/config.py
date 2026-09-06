@@ -86,6 +86,17 @@ class Settings:
     top_k_text: int = int(os.getenv("TOP_K_TEXT", "4"))
     top_k_image: int = int(os.getenv("TOP_K_IMAGE", "3"))
 
+    # --- Image ingest bounds -----------------------------------------------
+    # Real PDFs contain spacers, rules and bullets that carry no meaning, and
+    # logos repeated on every page. Without these bounds a single large manual
+    # decodes to gigabytes of base64 and exceeds the pod memory limit.
+    image_min_width: int = int(os.getenv("IMAGE_MIN_WIDTH", "32"))
+    image_min_height: int = int(os.getenv("IMAGE_MIN_HEIGHT", "32"))
+    image_furniture_page_fraction: float = float(
+        os.getenv("IMAGE_FURNITURE_PAGE_FRACTION", "0.5")
+    )
+    image_max_per_doc: int = int(os.getenv("IMAGE_MAX_PER_DOC", "1500"))
+
     # --- Eval gate ---------------------------------------------------------
     eval_judge_model: str = os.getenv("EVAL_JUDGE_MODEL", "gpt-4o-mini")
     # Optional: point the PRIMARY judge at a non-OpenAI, OpenAI-compatible
