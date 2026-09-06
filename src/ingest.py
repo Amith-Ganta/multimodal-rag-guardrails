@@ -139,6 +139,54 @@ def ingest_pdf(pdf_path: str | Path, doc_id: str | None = None) -> IngestResult:
     result = IngestResult(doc_id=doc_id)
     doc = fitz.open(pdf_path)
     try:
+        # --- image placement pre-pass ---
+        # A PDF page tree can share one inherited /Resources dictionary, in which
+        # case page.get_images() reports the whole document image pool on nearly
+        # every page rather than what that page draws. Scanning each content
+        # stream for the /Im names it actually invokes gives the real placements,
+        # which fixes both the page numbers and the memory blow-up.
+        page_image_xrefs: Dict[int, List[List[int]]] = {}
+        placement_counts: Dict[int, int] = {}
+
+        for page_num, page in enumerate(doc):
+            used_names = set()
+            for content_xref in page.get_contents():
+                try:
+                    stream = doc.xref_stream(content_xref).decode("latin-1", "ignore")
+                except Exception:
+                    continue
+                for token in stream.split():
+                    if token.startswith("/Im"):
+                        used_names.add(token[1:])
+
+            if not used_names:
+                page_image_xrefs[page_num] = []
+                continue
+
+            drawn: List[List[int]] = []
+            seen_on_page = set()
+
+            for img in page.get_images(full=True):
+                name = img[7]
+                xref = img[0]
+                if name in used_names and xref not in seen_on_page:
+                    drawn.append([xref, int(img[2] or 0), int(img[3] or 0)])
+                    seen_on_page.add(xref)
+
+            page_image_xrefs[page_num] = drawn
+            for xref, _w, _h in drawn:
+                placement_counts[xref] = placement_counts.get(xref, 0) + 1
+
+        page_count = len(doc)
+        # Furniture is judged on real placements from the pre-pass, never on
+        # get_images() reference counts.
+        furniture_threshold = int(SETTINGS.image_furniture_page_fraction * page_count)
+
+        # An empty string means "examined and rejected", so a repeated image is
+        # decoded at most once for the whole document.
+        image_b64_cache: Dict[int, str] = {}
+        kept_images = 0
+
         for page_num, page in enumerate(doc):
             # --- text ---
             page_text = page.get_text().strip()
@@ -154,23 +202,48 @@ def ingest_pdf(pdf_path: str | Path, doc_id: str | None = None) -> IngestResult:
                         )
                     )
             # --- images ---
-            for img_i, img in enumerate(page.get_images(full=True)):
-                xref = img[0]
-                try:
-                    base = doc.extract_image(xref)
-                    pil = Image.open(io.BytesIO(base["image"])).convert("RGB")
-                except Exception:
-                    # Skip anything PyMuPDF/PIL cannot decode; do not crash a run.
+            page_img_index = 0
+            for xref, meta_w, meta_h in page_image_xrefs.get(page_num, []):
+                if kept_images >= SETTINGS.image_max_per_doc:
+                    break
+
+                if placement_counts[xref] > furniture_threshold:
                     continue
-                buf = io.BytesIO()
-                pil.save(buf, format="PNG")
-                b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+                # Cheap metadata skip, so known-small images are never decoded.
+                if meta_w > 0 and meta_h > 0:
+                    if meta_w < SETTINGS.image_min_width or meta_h < SETTINGS.image_min_height:
+                        continue
+
+                if xref not in image_b64_cache:
+                    try:
+                        base = doc.extract_image(xref)
+                        pil = Image.open(io.BytesIO(base["image"])).convert("RGB")
+                    except Exception:
+                        # Skip anything PyMuPDF/PIL cannot decode; do not crash a run.
+                        image_b64_cache[xref] = ""
+                        continue
+                    # Metadata sometimes reports 0, so re-check the real size.
+                    if pil.width < SETTINGS.image_min_width or pil.height < SETTINGS.image_min_height:
+                        image_b64_cache[xref] = ""
+                        continue
+                    buf = io.BytesIO()
+                    pil.save(buf, format="PNG")
+                    image_b64_cache[xref] = base64.b64encode(buf.getvalue()).decode("ascii")
+
+                b64 = image_b64_cache[xref]
+                if not b64:
+                    continue
+
                 item = ImageItem(
                     doc_id=doc_id,
                     page=page_num,
-                    img_index=img_i,
+                    img_index=page_img_index,
                     b64_png=b64,
                 )
+                page_img_index += 1
+                kept_images += 1
+
                 result.images.append(item)
                 result.image_store[item.id] = b64
     finally:

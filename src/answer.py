@@ -48,7 +48,8 @@ class RetrievedContext:
     def as_retrieval_context(self) -> List[str]:
         """Flat list of strings for DeepEval's retrieval_context."""
         ctx = [h.chunk.text for h in self.text_hits]
-        ctx += [f"[image {h.image_id} from page {h.page}]" for h in self.image_hits]
+        # Internal pages are zero-based; add 1 for the human-facing display boundary.
+        ctx += [f"[image {h.image_id} from page {h.page + 1}]" for h in self.image_hits]
         return ctx
 
 
