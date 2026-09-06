@@ -38,10 +38,10 @@ resource "aws_subnet" "public" {
   map_public_ip_on_launch = true
 
   tags = {
-    Name                                          = "${var.project_name}-public-${local.azs[count.index]}"
-    Project                                       = var.project_name
-    "kubernetes.io/role/elb"                      = "1"
-    "kubernetes.io/cluster/${var.cluster_name}"   = "shared"
+    Name                                        = "${var.project_name}-public-${local.azs[count.index]}"
+    Project                                     = var.project_name
+    "kubernetes.io/role/elb"                    = "1"
+    "kubernetes.io/cluster/${var.cluster_name}" = "shared"
   }
 }
 

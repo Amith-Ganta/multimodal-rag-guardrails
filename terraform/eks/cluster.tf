@@ -43,10 +43,10 @@ resource "aws_eks_node_group" "default" {
 
   # cluster-autoscaler discovers this node group via this tag; do not remove.
   tags = {
-    Name                                                = "${var.project_name}-node"
-    Project                                             = var.project_name
-    "k8s.io/cluster-autoscaler/enabled"                 = "true"
-    "k8s.io/cluster-autoscaler/${var.cluster_name}"     = "owned"
+    Name                                            = "${var.project_name}-node"
+    Project                                         = var.project_name
+    "k8s.io/cluster-autoscaler/enabled"             = "true"
+    "k8s.io/cluster-autoscaler/${var.cluster_name}" = "owned"
   }
 
   depends_on = [

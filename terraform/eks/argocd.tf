@@ -31,43 +31,6 @@ resource "helm_release" "argocd" {
     aws_eks_node_group.default,
   ]
 
-  # The Application is rendered by the Helm release via extraObjects, so terraform plan
-  # does not need to read the Application CRD from a cluster that may not exist yet.
-  # extraObjects takes a list of nested manifests, which a helm provider v2 set{} block
-  # cannot express, hence values + yamlencode.
-  values = [
-    yamlencode({
-      extraObjects = [
-        {
-          apiVersion = "argoproj.io/v1alpha1"
-          kind       = "Application"
-          metadata = {
-            name      = "multimodal-rag"
-            namespace = "argocd"
-          }
-          spec = {
-            project = "default"
-            source = {
-              repoURL        = "https://github.com/Amith-Ganta/multimodal-rag-guardrails"
-              path           = "helm/multimodal-rag"
-              targetRevision = "main"
-            }
-            destination = {
-              server    = "https://kubernetes.default.svc"
-              namespace = "default"
-            }
-            syncPolicy = {
-              automated = {
-                prune    = true
-                selfHeal = true
-              }
-            }
-          }
-        }
-      ]
-    })
-  ]
-
   # ApplicationSet has no enabled/install toggle in chart 10.x; scale to zero instead.
   set {
     name  = "applicationSet.replicas"
@@ -162,6 +125,51 @@ resource "helm_release" "argocd" {
     name  = "redis.resources.limits.memory"
     value = "128Mi"
   }
+}
+
+# The Argo CD Application CR must be applied only after the argo-cd Helm
+# release has installed the Application CRD. Helm validates every manifest
+# in a release against the API server before applying any of them, so the
+# CR and CRD cannot live in the same release. The argocd-apps chart only
+# renders CRs and is deployed after argo-cd.
+resource "helm_release" "argocd_apps" {
+  name       = "argocd-apps"
+  repository = "https://argoproj.github.io/argo-helm"
+  chart      = "argocd-apps"
+  version    = "2.0.5"
+  namespace  = kubernetes_namespace.argocd.metadata[0].name
+
+  depends_on = [helm_release.argocd]
+
+  values = [
+    yamlencode({
+      applications = {
+        "multimodal-rag" = {
+          namespace = "argocd"
+          project   = "default"
+          source = {
+            repoURL        = "https://github.com/Amith-Ganta/multimodal-rag-guardrails"
+            path           = "helm/multimodal-rag"
+            targetRevision = "main"
+          }
+          destination = {
+            server    = "https://kubernetes.default.svc"
+            namespace = "default"
+          }
+          # Manual sync only. selfHeal = false was not enough: an automated
+          # policy still runs one initial sync, and git does not yet carry the
+          # image tag (CI injects it with --set at deploy time), so that sync
+          # rendered the chart's empty image.*.repository as a bare ":latest"
+          # and created InvalidImageName pods next to CI's healthy ones.
+          # ArgoCD still observes and reports drift, it just never applies.
+          # Revisit at the GitOps cutover, when CI writes the tag into git.
+          syncPolicy = {
+            syncOptions = ["CreateNamespace=false"]
+          }
+        }
+      }
+    })
+  ]
 }
 
 output "argocd_admin_password_command" {
