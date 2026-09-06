@@ -22,9 +22,9 @@
     },
     {
       "id": "g4",
-      "question": "What BLEU scores did the big Transformer model achieve on the WMT 2014 English-to-German and English-to-French translation tasks?",
-      "expected_output": "The big Transformer achieved a BLEU score of 28.4 on WMT 2014 English-to-German and 41.8 on WMT 2014 English-to-French.",
-      "expected_facts": ["28.4", "41.8", "BLEU"]
+      "question": "What BLEU scores does the Attention Is All You Need paper report for the big Transformer model on WMT 2014 English-to-German and English-to-French? Include the English-to-French discrepancy between the abstract/Table 2 and the body prose.",
+      "expected_output": "The big Transformer achieved a BLEU score of 28.4 on WMT 2014 English-to-German. For English-to-French, the abstract/Table 2 reports 41.8, while the body prose reports 41.0.",
+      "expected_facts": ["28.4", "41.8", "41.0", "BLEU"]
     },
     {
       "id": "g5",
