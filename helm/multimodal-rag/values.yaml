@@ -14,6 +14,9 @@ image:
 # 2 api + 2 ui replicas fit comfortably on 2 nodes with headroom for
 # kube-system/addons (cluster-autoscaler, metrics-server, vpa, goldilocks);
 # limits leave room for HPA to scale up before the autoscaler adds a 3rd node.
+# Steady state (2 api + 2 ui) requests 3.50 GiB of the 5.44 GiB available on
+# 2 nodes; worst case at max scale requests 8.00 GiB, which needs the 3rd node
+# and fits inside its 8.66 GiB ceiling.
 api:
   replicaCount: 2
   port: 8000
@@ -27,7 +30,9 @@ api:
   autoscaling:
     enabled: true
     minReplicas: 2
-    maxReplicas: 6
+    # 6 was unschedulable: 6Gi api + 3Gi ui + ~1Gi system exceeds the 9.66 GiB
+    # three-node ceiling. 5 is the largest count that still fits.
+    maxReplicas: 5
     targetCPUUtilizationPercentage: 70
     targetMemoryUtilizationPercentage: 80
   livenessProbe:
@@ -50,13 +55,19 @@ api:
 ui:
   replicaCount: 2
   port: 8501
+  # The UI pod runs ingest in-process, so it carries a ~527 MB Python import
+  # baseline plus ~248 MB transient per concurrent upload. A 512Mi request sat
+  # below that baseline, so the HPA read 81% of its 80% memory target at idle
+  # and pods were OOMKilled with no traffic at all. The request now sits above
+  # the baseline and the limit absorbs the baseline plus two concurrent uploads
+  # (527 + 2*248 = ~1023 MB) with headroom.
   resources:
     requests:
       cpu: 250m
-      memory: 512Mi
+      memory: 768Mi
     limits:
       cpu: 500m
-      memory: 1Gi
+      memory: 1536Mi
   autoscaling:
     enabled: true
     minReplicas: 2
