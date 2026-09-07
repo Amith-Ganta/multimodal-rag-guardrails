@@ -30,8 +30,13 @@ Thumbs.db
 # --- Terraform (applies recursively to every module, e.g. terraform/eks/) ---
 .terraform/
 .terraform.lock.hcl
-terraform.tfstate
-terraform.tfstate.backup
+# Wildcarded rather than the two exact filenames. A state file that has been
+# renamed or archived (terraform.tfstate.pre-s3-migration and the like) is
+# still a full inventory of the account's resources, and the exact-name form
+# quietly let those through.
+*.tfstate
+*.tfstate.*
+.state-archive/
 terraform.tfvars
 *.tfplan
 tfplan*.out

@@ -124,3 +124,87 @@ resource "helm_release" "elasticsearch" {
   # succeeded at 8.
   timeout = 900
 }
+
+# The index template for Fluent Bit's daily kube-* indices.
+#
+# This existed only as a hand-run curl against the Elasticsearch API for a while,
+# which is precisely the kind of thing that makes a rebuild differ from the
+# cluster it was copied from: every Terraform resource matches, and the replica
+# still reports yellow health forever.
+#
+# The reason it is needed: Elasticsearch defaults a new index to one replica, and
+# a replica shard can never be allocated to the same node as its primary. On a
+# single-node cluster that replica stays permanently unassigned, so every daily
+# index sits yellow. Zero replicas is the correct setting for one node, and one
+# shard avoids splitting a small daily index across shards for no benefit.
+#
+# It is a Job rather than a Terraform resource because index templates live in
+# the Elasticsearch API, which no provider in this stack speaks. The Job runs
+# in-cluster, where the ClusterIP service is reachable; a Terraform provider
+# would have to reach a service that is not exposed outside the VPC.
+#
+# PUT is idempotent, so a re-run overwrites with identical content. priority 100
+# beats the chart's own defaults without needing to know what they are.
+resource "kubernetes_job" "es_index_template" {
+  metadata {
+    name      = "es-index-template"
+    namespace = kubernetes_namespace.observability.metadata[0].name
+  }
+
+  spec {
+    # Six attempts because this races Elasticsearch's readiness: the pod can be
+    # Running while the HTTP API still refuses connections during bootstrap.
+    backoff_limit = 6
+
+    template {
+      metadata {}
+
+      spec {
+        restart_policy = "OnFailure"
+
+        container {
+          name  = "apply-template"
+          image = "curlimages/curl:8.11.1"
+
+          command = [
+            "sh",
+            "-c",
+            <<-EOT
+              set -e
+              until curl -sf "http://elasticsearch:9200/_cluster/health" >/dev/null; do
+                echo "waiting for elasticsearch"
+                sleep 5
+              done
+              curl -sf -X PUT "http://elasticsearch:9200/_index_template/kube-logs" \
+                -H 'Content-Type: application/json' \
+                -d '{"index_patterns":["kube-*"],"priority":100,"template":{"settings":{"number_of_replicas":0,"number_of_shards":1}}}'
+              echo
+              echo "kube-logs index template applied"
+            EOT
+          ]
+
+          resources {
+            requests = {
+              memory = "32Mi"
+              cpu    = "10m"
+            }
+            limits = {
+              memory = "64Mi"
+            }
+          }
+        }
+      }
+    }
+  }
+
+  # The Job must not count as complete before it has actually run, otherwise a
+  # subsequent apply reports success against a template that was never written.
+  wait_for_completion = true
+
+  timeouts {
+    create = "10m"
+    update = "10m"
+  }
+
+  depends_on = [helm_release.elasticsearch]
+}

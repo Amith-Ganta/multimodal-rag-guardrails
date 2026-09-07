@@ -147,8 +147,13 @@ resource "helm_release" "argocd_apps" {
         "multimodal-rag" = {
           namespace = "argocd"
           project   = "default"
+          # Derived from var.github_repo rather than written out, because a
+          # literal URL here is a silent failure in a fork or a second account:
+          # ArgoCD comes up healthy and syncs from the original owner's repo,
+          # so the replica runs someone else's manifests and nobody notices
+          # until a change lands that was never pushed to it.
           source = {
-            repoURL        = "https://github.com/Amith-Ganta/multimodal-rag-guardrails"
+            repoURL        = "https://github.com/${var.github_repo}"
             path           = "helm/multimodal-rag"
             targetRevision = "main"
           }

@@ -1,0 +1,37 @@
+# Template for a second AWS account. Copy to envs/<name>.tfvars and edit.
+#
+#   terraform apply -var-file=envs/<name>.tfvars
+#
+# Only two values normally need changing. Everything else can stay as-is,
+# including project_name: resource names collide across accounts only for
+# globally-unique services, and those are suffixed with the account id at
+# apply time rather than being spelled out here.
+
+# Required. No default exists, so an apply without this prompts interactively.
+aws_region = "<REGION>"
+
+# Change this if the replica syncs from a fork rather than the original repo.
+# It drives two things at once: the ArgoCD Application's repoURL, and the
+# GitHub OIDC trust condition on the CI role. Point it at a repo you do not
+# control and the replica happily deploys that repo's manifests.
+github_repo = "<OWNER>/<REPO>"
+
+# Set only if the cluster must coexist with another install in the same
+# account. Distinct names here are also what keeps this stack from ever
+# colliding with the separate banking_application_eks project.
+project_name = "multimodal-rag"
+cluster_name = "multimodal-rag-dev"
+
+kubernetes_version      = "1.31"
+node_instance_types     = ["t3.medium"]
+node_group_desired_size = 2
+node_group_min_size     = 2
+node_group_max_size     = 4
+
+# Restrict to your own CIDR if the caller's IP is stable. Defaults open because
+# it is not.
+# eks_public_access_cidrs = ["<YOUR_IP>/32"]
+
+# Leave unset unless an existing bucket must be reused. Empty means the name is
+# derived as <project_name>-velero-backups-<account id>.
+# velero_bucket_name = ""

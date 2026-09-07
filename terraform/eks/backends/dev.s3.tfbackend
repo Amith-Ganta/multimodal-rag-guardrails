@@ -1,0 +1,10 @@
+# Backend for the original dev account (651103158261, us-east-1).
+#
+#   terraform init -backend-config=backends/dev.s3.tfbackend
+#
+# Nothing secret lives here: a bucket name, an object key and a region. The
+# bucket itself is private, and access is governed by the caller's AWS
+# credentials, not by knowledge of the name.
+bucket = "multimodal-rag-tfstate-651103158261"
+key    = "dev/eks.tfstate"
+region = "us-east-1"

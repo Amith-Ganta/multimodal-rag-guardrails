@@ -1,0 +1,31 @@
+# Template for replicating this stack into a second AWS account.
+#
+# Copy to backends/<name>.s3.tfbackend, fill in the three values, then:
+#
+#   terraform init -reconfigure -backend-config=backends/<name>.s3.tfbackend
+#
+# -reconfigure matters when switching accounts in a working copy that has
+# already been initialised: without it Terraform offers to copy the existing
+# state into the new backend, which would seed the second account's state with
+# the first account's resource ids.
+#
+# The bucket must exist before init. Creating it here rather than in Terraform
+# is the standard chicken-and-egg exception: the state bucket cannot be managed
+# by the state it holds.
+#
+#   aws s3api create-bucket --bucket multimodal-rag-tfstate-<ACCOUNT_ID> --region <REGION>
+#   aws s3api put-bucket-versioning --bucket multimodal-rag-tfstate-<ACCOUNT_ID> \
+#     --versioning-configuration Status=Enabled
+#   aws s3api put-public-access-block --bucket multimodal-rag-tfstate-<ACCOUNT_ID> \
+#     --public-access-block-configuration \
+#     BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+#
+# Versioning is not optional. use_lockfile below prevents concurrent writes, but
+# only versioning recovers a state file that was corrupted or truncated.
+#
+# Note: outside us-east-1, create-bucket also needs
+#   --create-bucket-configuration LocationConstraint=<REGION>
+
+bucket = "multimodal-rag-tfstate-<ACCOUNT_ID>"
+key    = "dev/eks.tfstate"
+region = "<REGION>"

@@ -49,6 +49,7 @@ Read part 1 for what the system does. Read part 2 for how it is operated.
 
 - [Platform overview](#platform-overview)
 - [Infrastructure as code](#infrastructure-as-code)
+- [Replicating this into a second AWS account](#replicating-this-into-a-second-aws-account)
 - [The Kubernetes layer](#the-kubernetes-layer)
 - [Storage](#storage)
 - [Observability](#observability)
@@ -549,15 +550,31 @@ S3 conditional writes provide the same mutual exclusion using the bucket that al
 the state, which removes a table, an IAM policy, and a per-environment resource from every
 stack. One fewer thing to provision is one fewer thing to drift.
 
+The backend block is deliberately incomplete:
+
 ```hcl
 backend "s3" {
-  bucket       = "multimodal-rag-tfstate-651103158261"
-  key          = "dev/eks.tfstate"
-  region       = "us-east-1"
   encrypt      = true
   use_lockfile = true
 }
 ```
+
+The bucket, key and region are supplied at init time from `terraform/eks/backends/*.tfbackend`.
+That is not a style preference, it is the only mechanism available: a backend block cannot
+interpolate anything, because Terraform reads it before variables, locals and data sources
+have been evaluated. Every other globally-unique name in this stack derives its account id
+from `data.aws_caller_identity.current`; the state bucket is the one place that cannot.
+
+```bash
+terraform init -backend-config=backends/dev.s3.tfbackend
+```
+
+Hardcoding those three values is what pins a configuration to a single AWS account, and only
+half of that failure is loud. An operator in a second account either fails at init because
+they cannot write to the first account's bucket, or, if cross-account access has been granted
+at some point, plans against the first account's state and is shown a diff proposing to
+destroy infrastructure they have never seen. Leaving the values out turns both into an error
+on the first command.
 
 Provider versions are pinned (`aws ~> 5.0`, `kubernetes ~> 2.31`, `helm ~> 2.14`,
 `tls ~> 4.0`, `random ~> 3.6`) with `required_version >= 1.10.0`.
@@ -583,6 +600,93 @@ versions.tf  variables.tf  outputs.tf
 Every one of those files carries a header comment explaining why the component exists and
 what breaks without it. A future reader inheriting this stack should not have to reconstruct
 the reasoning from a git log.
+
+## Replicating this into a second AWS account
+
+The stack is account-agnostic. Nothing outside `backends/` and `envs/` names an account, a
+region or a repository, so standing it up somewhere else is configuration rather than a fork.
+
+Three things made that true, and each was a real defect found by auditing the stack against
+the question "what happens if someone runs this in an account that is not mine":
+
+**The backend**, covered above. Values moved out of `versions.tf` into `*.tfbackend` files.
+
+**The Velero backup bucket was referenced but never declared.** Three separate places held
+the literal string `multimodal-rag-velero-backups-651103158261`. This is the worst class of
+gap for a stack meant to be replicated, because it fails silently: in a fresh account
+`terraform apply` succeeds, every resource reports created, Velero installs and schedules its
+nightly job, and the backups then fail against a bucket that does not exist. The bucket is now
+declared here, with versioning, encryption, all four public-access switches and a lifecycle
+rule, and its name derives from the caller's account id:
+
+```hcl
+velero_bucket_name = coalesce(
+  var.velero_bucket_name,
+  "${var.project_name}-velero-backups-${data.aws_caller_identity.current.account_id}",
+)
+```
+
+The account id is not decoration. S3 names are global, so without the suffix a second account
+cannot create the bucket at all, and the IAM policy would grant the replica's Velero write
+access to the original account's backups.
+
+**The ArgoCD Application pointed at a hardcoded repository URL.** In a fork it would have
+happily reconciled against the upstream repo instead of the operator's own. It now derives
+from `var.github_repo`.
+
+One piece of drift was also closed while auditing: the Elasticsearch `kube-logs` index
+template existed only as a hand-run `curl` against the cluster API. It is now a
+`kubernetes_job`, because a rebuild where every Terraform resource matches and the replica
+still reports yellow health forever is exactly the failure this section exists to prevent.
+
+To stand up a new account:
+
+```bash
+cd terraform/eks
+
+# 1. Bootstrap the state bucket. This is the standard chicken-and-egg exception:
+#    it cannot be managed by the state it holds. Commands in backends/README.md.
+
+# 2. Describe the target.
+cp backends/example.s3.tfbackend.template backends/prod.s3.tfbackend
+cp envs/example.tfvars.template envs/prod.tfvars
+
+# 3. -reconfigure is not optional when switching accounts.
+terraform init -reconfigure -backend-config=backends/prod.s3.tfbackend
+terraform plan  -var-file=envs/prod.tfvars
+terraform apply -var-file=envs/prod.tfvars
+```
+
+`-reconfigure` matters. In a working copy already initialised against another backend, plain
+`init` offers to *copy* the existing state into the new one, which seeds the second account's
+state with the first account's resource ids. This is not hypothetical: initialising this
+directory after the backend was made partial hit exactly that prompt, because two
+pre-migration state files were still on disk from before the move to S3. They held 40
+resources under one lineage; the live state in S3 held 62 under a different one. Accepting
+the migration would have overwritten the live state with a copy 22 resources out of date.
+
+`envs/dev.tfvars` is deliberately not named `terraform.tfvars`, which Terraform auto-loads.
+An apply that silently picks up whichever tfvars happens to be on disk is how a plan ends up
+aimed at the wrong account. Naming the file on every command is the point.
+
+**Verifying zero drift.** The refactor above was planned against the live account before being
+committed. The number that matters is the last one:
+
+```
+Plan: 6 to add, 2 to change, 0 to destroy.
+```
+
+Nothing is destroyed and nothing is replaced, so the portability work touches no running
+infrastructure. The additions were the Velero bucket resources and the index-template job;
+the two in-place changes were reference rewrites from literal strings to resource attributes,
+whose resolved values were confirmed byte-identical to the live bucket name before applying.
+
+The original account needed a one-time `terraform import` for the Velero bucket, since it was
+created by hand long before it was declared. A second account will not: there the resources
+are simply created. The imports are worth recording because a clean import is falsifiable
+evidence rather than an assertion. After importing the bucket, its versioning, its encryption
+configuration and its public-access block, versioning and public-access-block dropped out of
+the plan entirely, which is what proves those resources match the live configuration exactly.
 
 ## The Kubernetes layer
 
@@ -1026,9 +1130,13 @@ Terraform:
 
 ```bash
 cd terraform/eks
-terraform init
-terraform plan
+terraform init -backend-config=backends/dev.s3.tfbackend
+terraform plan -var-file=envs/dev.tfvars
 ```
+
+Both arguments are required. The backend is a partial configuration and `aws_region` has no
+default, so a bare `terraform init` or `terraform plan` will not run. See
+[Replicating this into a second AWS account](#replicating-this-into-a-second-aws-account).
 
 ## Platform roadmap
 

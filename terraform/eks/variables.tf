@@ -1,7 +1,6 @@
 variable "aws_region" {
-  description = "AWS region to deploy into."
+  description = "AWS region to deploy into. No default on purpose: this stack is meant to be replicable into a second AWS account, and a default region is the kind of thing that gets inherited by accident rather than chosen. Set it in the tfvars file for the target account."
   type        = string
-  default     = "us-east-1"
 }
 
 variable "project_name" {
@@ -50,6 +49,18 @@ variable "github_repo" {
   description = "GitHub repo (owner/name) allowed to assume the CI IAM role via OIDC."
   type        = string
   default     = "Amith-Ganta/multimodal-rag-guardrails"
+}
+
+variable "velero_bucket_name" {
+  description = "S3 bucket holding Velero backups. Leave empty and it is derived as <project_name>-velero-backups-<account id>, which is what makes this stack replicable: S3 names are globally unique, so a hardcoded one either collides in a second account or, worse, resolves to the first account's bucket and silently backs up into it. Set explicitly only when an existing bucket must be reused."
+  type        = string
+  default     = ""
+}
+
+variable "velero_bucket_force_destroy" {
+  description = "Whether terraform destroy may delete the Velero bucket while it still holds backups. False everywhere that matters; true is only reasonable for a throwaway replication test."
+  type        = bool
+  default     = false
 }
 
 variable "eks_public_access_cidrs" {
