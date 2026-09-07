@@ -12,10 +12,16 @@ The repository is in two halves, and they are kept deliberately separate:
 
 - **Part 1, the AI system.** Retrieval, guardrails, the verification loop, the model gateway,
   and the evaluation gates. This is the substance of the project.
-- **Part 2, the platform it runs on.** Terraform, EKS, Helm, ArgoCD, Velero, Ansible, and a
-  seven-job CI/CD pipeline. This is how the AI system reaches production and stays there.
+- **Part 2, the platform it runs on.** Terraform, EKS, Helm, ArgoCD, Velero, Ansible, a
+  full observability stack, and a seven-job CI/CD pipeline. This is how the AI system reaches
+  production and stays there.
 
 Read part 1 for what the system does. Read part 2 for how it is operated.
+
+> **A note on the diagrams.** Every diagram below is Mermaid, which GitHub renders natively in
+> markdown. GitHub does not execute JavaScript or CSS animation inside a README, so nothing
+> here moves. Where a sequence needs to show time passing, it is drawn as a Mermaid sequence
+> diagram rather than promised as an animation that would silently render as a still image.
 
 ---
 
@@ -27,7 +33,9 @@ Read part 1 for what the system does. Read part 2 for how it is operated.
 - [Why two encoders instead of one](#why-two-encoders-instead-of-one)
 - [Architecture](#architecture)
 - [How a question is answered](#how-a-question-is-answered)
+- [The model gateway](#the-model-gateway)
 - [The verification loop](#the-verification-loop)
+- [Guardrails, and what happens when they are missing](#guardrails-and-what-happens-when-they-are-missing)
 - [Retrieval: fixing a real ranking failure](#retrieval-fixing-a-real-ranking-failure)
 - [Evidence: what was measured](#evidence-what-was-measured)
 - [The corpus](#the-corpus)
@@ -42,6 +50,9 @@ Read part 1 for what the system does. Read part 2 for how it is operated.
 - [Platform overview](#platform-overview)
 - [Infrastructure as code](#infrastructure-as-code)
 - [The Kubernetes layer](#the-kubernetes-layer)
+- [Storage](#storage)
+- [Observability](#observability)
+- [The mapping collision that made every surface look healthy](#the-mapping-collision-that-made-every-surface-look-healthy)
 - [GitOps with ArgoCD](#gitops-with-argocd)
 - [Backup and recovery](#backup-and-recovery)
 - [The CI/CD pipeline](#the-cicd-pipeline)
@@ -67,9 +78,9 @@ Ask a question about a document. The system:
 3. **Guards both ends.** NeMo Guardrails screens the incoming question and the outgoing
    answer. Prompt injection, attempts to extract the system prompt, and requests to leak
    configuration are refused.
-4. **Routes every model call through one gateway.** LiteLLM sits in front of every provider,
-   with a fallback chain, a response cache, and a cost audit trail. Swapping providers is a
-   configuration change, not a code change.
+4. **Routes every model call through one gateway.** A single gateway sits in front of every
+   provider, with a fallback chain, a response cache, rate-limit handling, and a cost audit
+   trail. Swapping providers is a configuration change, not a code change.
 5. **Checks its own answers.** A second agent re-reads the answer against the retrieved
    evidence and sends it back for another attempt if it does not hold up.
 6. **Refuses to ship if quality drops.** Three DeepEval suites run in CI as a merge gate.
@@ -93,6 +104,9 @@ So the system runs two encoders against two FAISS indexes:
 | Text | `all-MiniLM-L6-v2` | 384 | `IndexFlatIP` |
 | Images | CLIP `ViT-B/32` | 512 | `IndexFlatIP` |
 
+Both indexes are inner-product over L2-normalized vectors, which makes the inner product a
+cosine similarity and keeps the two scoring scales comparable.
+
 Images are still retrieved from a text query. CLIP's *text* tower encodes the query and
 searches the *image* index, which is cross-modal retrieval and is exactly what CLIP is good
 at. It just never has to encode a long document chunk.
@@ -103,7 +117,7 @@ at. It just never has to encode a long document chunk.
 flowchart TD
     subgraph Ingestion
         PDF[PDF] --> EX[Extract text and images]
-        EX --> CH[Chunk text]
+        EX --> CH[Heading-aware chunking]
         EX --> IM[Extract page images]
         CH --> TE[MiniLM text encoder 384d]
         IM --> IE[CLIP image encoder 512d]
@@ -114,14 +128,15 @@ flowchart TD
     subgraph Query
         Q[User question] --> GI[Guardrails: input]
         GI -->|blocked| REF[Refusal]
-        GI -->|allowed| RT[Retrieve text top-k]
+        GI -->|allowed| RT[Retrieve text, over-fetch 4k]
         GI --> RI[Retrieve images top-k]
         TI --> RT
         II --> RI
-        RT --> RR[Lexical rerank over candidate pool]
+        RT --> DF[Drop degenerate chunks]
+        DF --> RR[Lexical rerank, cosine + 0.35 x overlap]
         RR --> CTX[Assemble context]
         RI --> CTX
-        CTX --> GW[LiteLLM gateway]
+        CTX --> GW[LLM gateway]
         GW --> LLM[Vision-capable model]
         LLM --> GO[Guardrails: output and grounding]
         GO --> ANS[Answer with citations]
@@ -139,7 +154,7 @@ sequenceDiagram
     participant API as FastAPI
     participant G as Guardrails
     participant IX as FAISS indexes
-    participant GW as LiteLLM gateway
+    participant GW as LLM gateway
     participant M as Model
 
     U->>API: POST /ask
@@ -151,6 +166,9 @@ sequenceDiagram
         IX-->>API: ranked chunks and images
         API->>GW: prompt with context and images
         GW->>M: call primary
+        alt rate limited
+            GW->>GW: parse Retry-After, back off, retry
+        end
         alt primary fails
             GW->>M: call fallback
         end
@@ -161,6 +179,25 @@ sequenceDiagram
         API-->>U: answer with citations
     end
 ```
+
+## The model gateway
+
+Every model call in the system goes through one object. That is the whole point: fallbacks,
+caching, concurrency limits, rate-limit handling, and cost accounting each need exactly one
+place to live, and direct provider calls scattered through the code make all five impossible
+to add later.
+
+| Concern | How the gateway handles it |
+|---|---|
+| Provider outage | Ordered fallback chain, configured not coded |
+| Rate limiting | Parses the provider's own "try again in Xms" hint out of the error, backs off for that long, retries up to 3 times, then falls back to a fixed 2 second wait |
+| Concurrency | A semaphore caps in-flight calls so a burst of parallel requests cannot trip the provider's limit in the first place |
+| Cost | Every call appends a record with model, prompt tokens, completion tokens, and cost |
+| Repeat questions | Response cache, on by default |
+
+`GET /gateway/summary` returns that audit log aggregated by model. Cost is attributable per
+model rather than per month, which is what makes a fallback chain safe to run: when traffic
+shifts to a more expensive provider, the ledger says so immediately.
 
 ## The verification loop
 
@@ -179,9 +216,40 @@ flowchart LR
     V -.retry limit reached.-> OUT2[Return with caveat]
 ```
 
+The verifier returns a parsed verdict, not free text: a decision, its reasoning, and the
+objection that goes back to the retriever. Parsing it into a structured verdict is what makes
+the loop terminable, because a free-text critique gives the loop nothing to branch on.
+
 The retry limit is bounded. When it is reached the answer is returned with its caveat rather
 than looping, because an endpoint that hangs is worse than an endpoint that is honest about
 its uncertainty.
+
+## Guardrails, and what happens when they are missing
+
+NeMo Guardrails 0.24.0 wraps the RAG call rather than sitting beside it. The RAG pipeline is
+registered as an *action* that the rails invoke, so the input rail runs before retrieval ever
+happens and the output rail sees the real answer object rather than a copy.
+
+```mermaid
+flowchart TD
+    Q[Question] --> BUILD{Rails available?}
+    BUILD -->|no config, no judge key,<br/>or build failed| FC{fail_closed?}
+    FC -->|true| BLOCK[Refuse and say why]
+    FC -->|false| UNG[Answer unguarded, log the degradation]
+    BUILD -->|yes| IN[Input rail: self-check]
+    IN -->|blocked| REF[Refusal]
+    IN -->|allowed| ACT[rag_answer action:<br/>retrieve, generate]
+    ACT --> OUT[Output rail: self-check + grounding]
+    OUT -->|blocked| REF
+    OUT -->|allowed| ANS[Answer]
+```
+
+The branch on the left is the honest part. If the NeMo dependency is missing, if no judge key
+is configured, or if the rails fail to build, the system does not crash: it degrades. Whether
+it degrades to unguarded or to refusing everything is a single configuration flag, and both
+paths are logged. The default is to degrade, which is right for a demo and wrong for a
+production system carrying real user traffic. It is called out here rather than left for
+someone to discover.
 
 ## Retrieval: fixing a real ranking failure
 
@@ -210,6 +278,12 @@ by a specific observed failure:
 Cosine remains the dominant term. The lexical signal only decides near-ties, which is where
 the bi-encoder was demonstrably wrong.
 
+Chunking was fixed in the same pass. A chunk that begins mid-section loses the heading that
+says what it is about, so headings are carried forward into the chunk below them and a
+trailing heading at a chunk boundary is pushed down rather than orphaned. The carry is capped
+at 80 characters, because a heading long enough to dominate the chunk stops being context and
+starts being noise.
+
 Notably, this is **not** a cross-encoder rerank, which was the obvious fix and the one
 originally planned. A cross-encoder would have meant a second model, more latency, and more
 memory in every pod. The lexical rerank fixed the measured failure at effectively zero
@@ -224,6 +298,7 @@ Every number below comes from a logged run against real models, not from an esti
 | Backend behavioral battery, 14 live cases | 12 of 14 passed |
 | PII and leakage gate, DeepEval GEval, 5 probes | 5 of 5, 100 percent |
 | Retriever quality gate, 5 goldens | 4 of 5 clean, 1 documented ranking limitation |
+| Multimodal RAG gate, 5 goldens x 3 metrics | 12 of 12 metrics passing at the current thresholds |
 | Concurrency, parallel `/ask` | 8 of 8 correct, zero cross-contamination |
 | Concurrency, parallel gateway audit | 40 of 40, zero errors |
 | Cold start | 135.0 seconds |
@@ -259,6 +334,10 @@ Detail behind those rows:
 `data/attention.pdf`, the "Attention Is All You Need" paper: 103 text chunks and 3 extracted
 diagrams. A real paper with real figures, so image retrieval has something meaningful to
 retrieve and the goldens can be checked against a document anyone can read.
+
+Users can also upload their own PDF through the UI, which is what pushed the ingestion work
+onto a queue rather than leaving it inline. That story is in [Observability](#observability),
+because it is a platform problem with an application symptom.
 
 `scripts/make_sample_pdf.py` generates a synthetic fallback document. It exists so the test
 suite can run without the corpus present. It is not the corpus.
@@ -310,8 +389,31 @@ Or all of them with a summary:
 python scripts/run_eval.py
 ```
 
-The judge is `gpt-4o-mini`, wrapped in `evals/robust_judge.py` to survive malformed judge
-output rather than failing the run on a JSON parse error.
+The main suite runs **five goldens against three metrics each**:
+
+| Metric | Threshold | What it catches |
+|---|---|---|
+| `AnswerRelevancyMetric` | 0.7 | An answer that is true but does not address the question |
+| `FaithfulnessMetric` | 0.7 | An answer not supported by the retrieved context |
+| `GEval` "Correctness" | 0.5 | An answer that misses the specific facts the golden requires |
+
+The GEval criteria are generated per golden from that golden's `expected_facts`, so
+"correct" means what the golden says it means rather than what a generic rubric assumes.
+
+**The judge needed its own engineering, and that is worth explaining.** The judge is
+`gpt-4o-mini`, and it fails in two reproducible ways:
+
+- On complex goldens it runs out of output tokens mid-JSON. Raising `max_tokens` does not
+  help, because 16384 is the model's ceiling rather than a configuration value. So
+  `evals/robust_judge.py` retries once with a compacted prompt, and if that still truncates,
+  hands the case to a larger-output fallback judge.
+- On at least one golden it emits an unescaped backslash inside a `reason` string,
+  deterministically, producing invalid JSON. `evals/json_repair_patch.py` repairs that before
+  any GEval metric runs.
+
+The leakage suite deliberately does **not** use `PIILeakageMetric`. That metric extracts PII
+from the whole test case including the probe input, so a probe that *contains* a fake secret
+scores as a leak whatever the system answers. It uses a rubric against the output alone.
 
 On Windows, set these before running or DeepEval's console output will break the run:
 
@@ -331,17 +433,18 @@ Everything is environment-driven. Nothing model-related is hardcoded.
 | `GATEWAY_CACHE` | `true` | Response cache |
 | `GATEWAY_TIMEOUT_SEC` | `60` | Per-call timeout |
 | `GUARDRAILS_ENABLED` | `true` | NeMo Guardrails on both ends |
+| `GUARDRAILS_FAIL_CLOSED` | `false` | Refuse rather than degrade when rails cannot build |
 | `TOP_K_TEXT` | | Text chunks retrieved |
 | `TOP_K_IMAGE` | | Images retrieved |
 | `EVAL_JUDGE_MODEL` | `gpt-4o-mini` | DeepEval judge |
-| `EVAL_THRESHOLD` | | Pass threshold for eval gates |
+| `EVAL_THRESHOLD` | `0.7` | Pass threshold for eval gates |
 
 ## Design decisions worth defending
 
-**One gateway, one audit trail.** Every model call goes through LiteLLM. That gives one place
-for fallbacks, one place for caching, and one cost ledger that can attribute spend per model.
-Direct provider calls scattered through the code would make each of those three things
-impossible to add later.
+**One gateway, one audit trail.** Every model call goes through it. That gives one place
+for fallbacks, one place for caching, one place for rate-limit backoff, and one cost ledger
+that can attribute spend per model. Direct provider calls scattered through the code would
+make each of those impossible to add later.
 
 **Fail soft, never hang.** Guardrails degrade rather than block on error. The fallback chain
 covers provider outages. The A2A loop has a hard retry cap. Every timeout is explicit. A
@@ -363,10 +466,10 @@ because it manufactures false confidence.
 
 ## Known limitations
 
-**Guardrails fail soft, and arguably should not.** If the NeMo dependency is missing the
-system logs and continues unguarded. That is the right call for a demo and the wrong call
-for production, where a missing safety layer should refuse to start. It is a one-line change
-gated on an environment flag; it is called out here rather than quietly left.
+**Guardrails fail soft by default, and arguably should not.** If the NeMo dependency is
+missing the system logs and continues unguarded. `GUARDRAILS_FAIL_CLOSED` flips this, and a
+production deployment should set it. The default is chosen for a demo, and it is called out
+here rather than quietly left.
 
 **Two judge-side scoring quirks remain.** The judge occasionally penalizes a correct answer
 for phrasing, and occasionally rewards a fluent but under-grounded one. Thresholds are set
@@ -384,7 +487,8 @@ the index into the image. Anyone running from source should build the index firs
 # Part 2: the platform
 
 Everything above runs on infrastructure that is entirely defined in code, deployed by a
-pipeline that refuses to promote a build it cannot vouch for.
+pipeline that refuses to promote a build it cannot vouch for, and instrumented well enough
+that a crash which happened an hour ago is still investigable.
 
 ## Platform overview
 
@@ -411,13 +515,13 @@ flowchart TD
 
     subgraph EKS [Amazon EKS: 3 x t3.medium]
         API[api deployment x2] --> HPA1[HPA 2-5]
-        UI[ui deployment x2] --> HPA2[HPA 2-4]
+        UI[ui deployment] --> HPA2[HPA]
         API --- PDB[PodDisruptionBudget]
         ARGO[ArgoCD] -.observes drift.-> API
         VEL[Velero] -.nightly backup.-> S3B[(S3)]
         CA[cluster-autoscaler] --> ASG[node group 2-4]
         MS[metrics-server] --> HPA1
-        VPA[VPA + Goldilocks] -.right-sizing advice.-> API
+        OBS[observability namespace]
     end
 
     ELB[AWS load balancer] --> UI
@@ -434,7 +538,7 @@ cannot touch the EC2 environment:
 | Stack | State key | Provisions |
 |---|---|---|
 | `terraform/` | `dev/ec2.tfstate` | Single-host EC2 deployment |
-| `terraform/eks/` | `dev/eks.tfstate` | VPC, EKS cluster, node group, IAM, ECR, addons |
+| `terraform/eks/` | `dev/eks.tfstate` | VPC, EKS cluster, node group, IAM, ECR, addons, ArgoCD, Velero, storage, observability |
 
 **Remote state on S3 with native locking.** Bucket `multimodal-rag-tfstate-651103158261`,
 encrypted at rest, with Terraform 1.10+ `use_lockfile = true`.
@@ -456,16 +560,29 @@ backend "s3" {
 ```
 
 Provider versions are pinned (`aws ~> 5.0`, `kubernetes ~> 2.31`, `helm ~> 2.14`,
-`tls ~> 4.0`) with `required_version >= 1.10.0`.
+`tls ~> 4.0`, `random ~> 3.6`) with `required_version >= 1.10.0`.
 
 **The network** is a purpose-built VPC: internet gateway, public subnets across availability
 zones, route table and associations. Not the default VPC.
 
 **IAM is least-privilege and role-based throughout.** Separate roles for the cluster control
-plane and the node group. Cluster-autoscaler and Velero each authenticate through IRSA
-against the cluster's OIDC provider, so neither holds a static credential. GitHub Actions
-authenticates to AWS through OIDC federation, which means **there are no AWS access keys
-stored in GitHub secrets at all**, and nothing to rotate or leak.
+plane and the node group. Cluster-autoscaler, Velero and the EBS CSI driver each authenticate
+through IRSA against the cluster's OIDC provider, so none of them holds a static credential.
+GitHub Actions authenticates to AWS through OIDC federation, which means **there are no AWS
+access keys stored in GitHub secrets at all**, and nothing to rotate or leak.
+
+The `terraform/eks/` stack is split one file per concern rather than one large `main.tf`:
+
+```
+network.tf   cluster.tf   iam.tf       ecr.tf       addons.tf
+storage.tf   argocd.tf    velero.tf
+kafka.tf     elasticsearch.tf   fluentbit.tf   prometheus.tf   grafana.tf
+versions.tf  variables.tf  outputs.tf
+```
+
+Every one of those files carries a header comment explaining why the component exists and
+what breaks without it. A future reader inheriting this stack should not have to reconstruct
+the reasoning from a git log.
 
 ## The Kubernetes layer
 
@@ -477,17 +594,25 @@ populated by CI at deploy time, an HPA, and a PodDisruptionBudget.
 
 | Concern | Implementation |
 |---|---|
-| Horizontal scaling | HPA on API (2 to 5) and UI (2 to 4), CPU 70 percent, memory 80 percent |
+| Horizontal scaling | HPA on API (2 to 5), CPU 70 percent, memory 80 percent |
 | Node scaling | cluster-autoscaler 9.37.0 against the managed node group |
 | Metrics | metrics-server 3.12.1 |
 | Right-sizing | VPA 4.5.0 in recommendation mode with Goldilocks 11.1.0 as the dashboard |
 | Disruption safety | PodDisruptionBudget, `minAvailable: 1` |
-| Availability | 2 replicas of each service, rolling updates |
+| Availability | Rolling updates, multiple API replicas |
 
 **Resource requests are set from measurement, not from habit.** The API HPA maximum is 5,
 not the 6 it was originally. Six was unschedulable: 6Gi of API plus 3Gi of UI plus roughly
 1Gi of system overhead exceeds the 9.66 GiB allocatable across three nodes. VPA and
 Goldilocks run in recommendation mode precisely so those numbers come from observed usage.
+
+**The UI runs a single replica, and that is a correctness decision rather than a cost one.**
+An uploaded PDF is ingested into the index held by the pod that received the upload. With two
+UI replicas behind one service, the follow-up question load-balances to the other pod, which
+has never seen the file and answers from the default corpus instead. The user sees their
+upload accepted and then apparently ignored. Pinning to one replica makes the behaviour
+correct today; the real fix is shared state, which is what the Kafka queue and a separate
+ingestion worker exist to enable.
 
 **ArgoCD's own footprint is packed by hand** rather than left at chart defaults: the
 application controller and server on one node, the repo server and Redis on the other, with
@@ -496,6 +621,174 @@ total, so a component has to fit in one node's remaining headroom rather than th
 both. Dex and notifications are disabled (no SSO, no Slack target) and the ApplicationSet
 controller is scaled to zero, because chart 10.x renders it unconditionally with no enable
 toggle.
+
+**A capacity limit worth knowing about, because it is not a memory limit.** A `t3.medium`
+caps at **17 pods per node**. That is an ENI address limit, and it applies with gigabytes of
+RAM still free. One node hit it and a DaemonSet pod could not schedule. A DaemonSet cannot
+relocate, so that node would have shipped no logs at all, while a Deployment competing for
+the same slot could sit anywhere. Something had to give, and the reasoning behind which
+component lost is in [Observability](#observability).
+
+## Storage
+
+The cluster ships the **AWS EBS CSI driver** as a managed addon (`v1.65.0-eksbuild.1`) with
+its own IRSA role, plus a `gp3` StorageClass set as the cluster default.
+
+This replaced the legacy in-tree `kubernetes.io/aws-ebs` provisioner, and the replacement was
+not optional. In-tree EBS provisioning is removed in modern Kubernetes, and every stateful
+component added below (Kafka, Elasticsearch, Prometheus, Grafana) asks for a
+PersistentVolumeClaim. Without a working CSI driver those PVCs sit `Pending` forever and the
+StatefulSets never start, with no error that names the actual cause.
+
+`gp3` over `gp2` is a straightforward win: baseline throughput and IOPS are decoupled from
+volume size, so a small volume is not automatically a slow one.
+
+## Observability
+
+Five components in an `observability` namespace, all deployed by Terraform, all with explicit
+resource requests because an unbounded logging stack on a cluster this tight will starve the
+application it is supposed to be observing.
+
+```mermaid
+flowchart LR
+    subgraph Nodes
+        P1[app pods] --> LOGS[/var/log/containers/]
+        P2[system pods] --> LOGS
+    end
+
+    LOGS --> FB[Fluent Bit DaemonSet]
+    FB -->|kubernetes filter:<br/>pod, namespace, labels| ES[(Elasticsearch<br/>single node)]
+
+    P1 -.metrics.-> PROM[Prometheus]
+    KSM[kube-state-metrics] --> PROM
+    NE[node-exporter DaemonSet] --> PROM
+    KJMX[Kafka JMX exporter] --> PROM
+
+    ES --> GRAF[Grafana]
+    PROM --> GRAF
+
+    UP[PDF upload] -.future worker.-> KAFKA[Kafka KRaft]
+    KAFKA -.consumer lag.-> KJMX
+```
+
+| Component | Chart | Role |
+|---|---|---|
+| Kafka | Bitnami `32.4.3`, KRaft mode | Ingestion queue |
+| Elasticsearch | Bitnami `22.1.6`, single node | Log store |
+| Fluent Bit | Fluent `0.58.1` (binary v5.1.1) | Log shipper, DaemonSet |
+| Prometheus | `29.27.2` | Metrics, 15 day retention |
+| Grafana | `10.5.15` | Single pane over both datasources |
+
+**Kafka exists because of an outage, not because it is fashionable.** PDF ingestion used to
+run inline in the Streamlit pod. A 13.5 MB CAD manual rasterized every page and ran CLIP in
+the UI process, the container crossed its memory limit, and Kubernetes killed it with **exit
+137**. That did not fail one request; it took down every other user's session on that pod.
+Publishing a job to a queue instead moves the heavy work to a worker that can die without
+anyone noticing. The broker is deployed, healthy, and exporting JMX metrics. The consumer is
+the next piece of application work, and Kafka standing up with no consumer is the correct
+intermediate state rather than a half-finished one.
+
+**Kibana is deliberately not deployed.** Grafana already reads Elasticsearch through a
+provisioned datasource, so Kibana would cost roughly 500Mi to show the same data behind a
+second login. On a cluster with 9.66 GiB allocatable in total, that is a real trade, not a
+rounding error.
+
+**Elasticsearch runs as one node holding every role.** The chart's default topology is four
+separate roles at two replicas each: eight pods, with the data nodes alone requesting a
+1024m heap apiece. Collapsing to a single node is the only shape that fits, and it is legal
+only because `master.masterOnly` is set to `false`. Left at its default of `true` the master
+refuses to store data, the dedicated data nodes cannot be scaled to zero, and Elasticsearch
+has nowhere to put anything.
+
+The heap is deliberately set **below** the container memory limit (768m heap against a 1536Mi
+limit). Elasticsearch needs substantial off-heap memory for Lucene segments and the JVM
+itself, so a heap sized at the limit produces an OOMKill instead of a garbage collection.
+
+**The Elasticsearch metrics exporter is disabled, and this is the pod-count limit cashing
+out.** With a node at its 17-pod ceiling, the choice was between shard and JVM statistics for
+a single-node Elasticsearch, and log shipping from an entire node. Logs won: a missing
+exporter leaves a gap in a dashboard, while a missing shipper leaves a node whose crashes
+cannot be investigated after the fact. It is a documented trade with a documented trigger for
+reversing it, not an omission.
+
+**Grafana is `ClusterIP` and reached by port-forward.** A LoadBalancer would mean a second
+public ELB and an internet-facing login for a dashboard one person uses. Its admin password is
+generated by Terraform into a Kubernetes Secret rather than written into this repository; the
+chart reads the secret rather than taking a plaintext value, which keeps the password out of
+the Helm release record stored in the cluster.
+
+```bash
+kubectl -n observability port-forward svc/grafana 3000:80
+```
+
+Both datasources are provisioned from Terraform rather than clicked in the UI, because
+anything added by hand exists only in that pod's database and has to be recreated after every
+reinstall.
+
+## The mapping collision that made every surface look healthy
+
+This is the observability equivalent of the retrieval failure in part 1: it started as a
+symptom that pointed nowhere near its cause, and it is the platform story most worth reading.
+
+Fluent Bit was running. Elasticsearch was running. Document counts were climbing, 3244 then
+6966. And Fluent Bit's own metrics endpoint reported:
+
+```
+errors: 0        dropped_records: 0        retries_failed: 0        retries: 2236
+```
+
+Zero errors, zero drops, and two thousand retries. Elasticsearch's `index_failed` counter sat
+at **0**. Every health surface said the pipeline was fine while a large fraction of logs never
+landed.
+
+The reason `index_failed` stayed at zero is that the rejection happens during document
+*parsing*, before the counter that tracks indexing failures is ever reached. Elasticsearch
+logged the real cause only at **INFO** level:
+
+```
+object mapping for [kubernetes.labels.app] tried to parse field [app] as object,
+but found a concrete value
+```
+
+Kubernetes pods carry labels like `app.kubernetes.io/name`. Elasticsearch reads a dot as
+nesting, so that label arrives as an *object* at `kubernetes.labels.app`. A pod carrying a
+plain `app` label sends a *string* at the same path. One index cannot hold both shapes.
+Whichever arrived first won the mapping, and every record from the other group was rejected
+for the rest of that day's index.
+
+Two configuration lines fixed it:
+
+- `Replace_Dots On` turns the dots into underscores, so the two label families stop colliding.
+- `Trace_Error On` makes Fluent Bit print the response body Elasticsearch sends back on a
+  failed bulk write. Without it, a failed flush reports that it failed and nothing about why,
+  which is what turned this into guesswork rather than a lookup.
+
+Then the poisoned index had to be deleted so a fresh mapping could form, because a mapping is
+fixed once set.
+
+**I got the diagnosis wrong first, and that is worth recording.** The initial suspect was an
+unassigned replica shard leaving the cluster yellow, which is real on a single node where the
+chart defaults to one replica. An index template fixing it was applied, the cluster turned
+green, and the flush failures continued unchanged. The template was kept because it is correct
+for a single-node cluster. But it was not the bug, and a green cluster that still drops logs
+is exactly the kind of false confidence that makes the next hour of debugging harder.
+
+Three other silent failures were caught in the same component, each of which produces a
+healthy-looking DaemonSet that ships nothing:
+
+| Setting | What goes wrong without it |
+|---|---|
+| `Suppress_Type_Name On` | Elasticsearch 8+ removed mapping types. Fluent Bit still sends `_type`, and every record is rejected with a 400. |
+| `Host elasticsearch` | The chart defaults to `elasticsearch-master`, which in this release is the *headless* service. Shipping there resolves to pod IPs and bypasses the service entirely. |
+| `Exclude_Path /var/log/containers/fluent-bit*` | A shipping error is written to Fluent Bit's own log, which Fluent Bit reads and tries to ship, which fails and logs again. The loop is self-sustaining and saturates the output. |
+
+`Retry_Limit False` means retry forever rather than drop. On a single-node Elasticsearch that
+restarts occasionally, dropping would lose exactly the logs from the incident worth
+investigating.
+
+**A debugging note that cost real time:** the Fluent Bit image has no `curl`, so
+`kubectl exec ... curl` fails with `executable file not found in $PATH`. Port-forward the
+pod's metrics port and curl from the host instead.
 
 ## GitOps with ArgoCD
 
@@ -520,9 +813,9 @@ never scaled the healthy ReplicaSet down. That is luck, not design, and it is ex
 kind of near-miss worth writing down.
 
 The fix removed `automated` entirely, leaving ArgoCD to observe and report but never apply.
-Repair was `helm upgrade --reuse-values`, because ArgoCD had mutated the live Deployment
-objects directly without touching the Helm release's stored values, so the release still held
-the correct configuration. Zero downtime; the four healthy pods were never restarted.
+Repair was `helm upgrade`, because ArgoCD had mutated the live Deployment objects directly
+without touching the Helm release's stored values, so the release still held the correct
+configuration. Zero downtime; the healthy pods were never restarted.
 
 ArgoCD currently reports `OutOfSync / Healthy`, and that status is **correct rather than
 broken**. The running pods carry a real image tag while git alone renders `:latest`. The
@@ -546,19 +839,23 @@ there is no long-lived secret in the cluster.
 - **Verified with a real restore-grade backup:** `verify-backup-001`, Completed, 178 of 178
   items, 1.1 MiB in S3
 
-**What is not backed up, stated explicitly:** persistent volume data. There is no EBS CSI
-driver addon, no PersistentVolumeClaims exist, the only storage class is legacy in-tree
-`kubernetes.io/aws-ebs`, and `verify-backup-001-volumesnapshots.json.gz` is 29 bytes, an
-empty gzip.
+**What that backup covered when it was taken, stated explicitly:** Kubernetes objects only,
+no persistent volume data. At the time there were no PersistentVolumeClaims to snapshot and
+`verify-backup-001-volumesnapshots.json.gz` was 29 bytes, an empty gzip.
 
-This is not currently a gap, because the workload is entirely stateless: two Deployments with
-the FAISS indexes baked into the images. Recovery means restoring the Velero backup onto a
-rebuilt cluster, after which the pods come back pointing at the same ECR images.
+That has since changed. The observability stack introduced four PVCs (Kafka, Elasticsearch,
+Prometheus, Grafana) on the `gp3` class backed by the EBS CSI driver. Velero's snapshot path
+is enabled, and the prerequisite that was previously missing (a CSI driver) now exists.
+**Snapshot coverage for those volumes has not yet been verified with a restore**, and until a
+restore has actually been performed it should be treated as unproven rather than working.
 
-It becomes a gap the moment anything stateful is added, and at that point it needs the EBS
-CSI driver addon, a `VolumeSnapshotClass`, and a storage class on `ebs.csi.aws.com`. Velero's
-snapshot path is already enabled and waiting. I would rather document the boundary of what a
-backup covers than let someone discover it during an incident.
+The application workload itself remains stateless: the FAISS indexes are baked into the
+images, so recovery means restoring the Velero backup onto a rebuilt cluster and letting the
+pods come back pointing at the same ECR images. The observability data is the part where a
+restore would need testing, and it is the lower-stakes half.
+
+I would rather document the boundary of what a backup covers than let someone discover it
+during an incident.
 
 ## The CI/CD pipeline
 
@@ -593,6 +890,16 @@ flowchart LR
 Both deploy jobs depend on `test`, `e2e`, **and** `security-scan`. A vulnerable image cannot
 reach either environment regardless of whether its tests pass.
 
+Two details in the workflow are load-bearing:
+
+- **`deploy-eks` self-skips when `vars.EKS_CLUSTER_NAME` is empty.** The EKS environment is
+  torn down between work sessions to control cost. Without that guard, every push after a
+  teardown fails a job that was never meant to run, and a permanently red pipeline stops
+  being a signal.
+- **Fork pull requests never see secrets.** Every step that touches a secret is guarded on
+  the head repository matching this one. A fork PR runs the build and the tests and stops
+  short of anything that could exfiltrate a credential.
+
 ## Security posture
 
 **Four scanners, all failing the build rather than reporting.**
@@ -619,15 +926,36 @@ and vault files are all gitignored, and every broad `git add` is preceded by an 
 `git check-ignore` and `git add --dry-run` verification. State can contain secrets; treating
 it as ordinary output is a common and expensive mistake.
 
+**Where this deployment deliberately relaxes security, and why.** Elasticsearch runs with
+X-Pack disabled and Kafka's client listener is `PLAINTEXT`. Both are `ClusterIP` services
+reachable only from inside the cluster, holding this cluster's own container logs and its own
+ingest jobs. Enabling SASL on a queue nothing outside the cluster can reach means managing
+credentials for no gain in a threat model where anyone who can reach the broker already has
+pod-exec in the namespace. A deployment carrying real user documents would enable both, and
+that boundary is stated in the Terraform itself rather than only here.
+
+**One dependency risk is named rather than hidden.** Bitnami moved its free images to a
+`bitnamilegacy` organisation in 2025, and the tags these charts default to now return 404
+from Docker Hub. That failure mode is nasty: `terraform apply` succeeds, Helm reports the
+release deployed, and the pods sit in `ImagePullBackOff`. The images are pinned to
+`bitnamilegacy` explicitly, which works and is verified against the registry. `bitnamilegacy`
+carries no update guarantee and receives no security patches, so the real answer is either a
+Bitnami Secure Images subscription or mirroring these images into the ECR registry this
+project already owns. It is a deliberate, time-boxed choice for a dev cluster, and it is
+written down as one.
+
 ## Cost and capacity
 
 The environment is deliberately small and its constraints are known rather than assumed:
 
 - 3 `t3.medium` nodes, 9.66 GiB allocatable in total
+- **17 pods per node**, an ENI address limit independent of free memory
 - Node group scales 2 to 4 under cluster-autoscaler
 - API and UI images are roughly 1.69 GB each
 - ArgoCD trimmed to roughly 220m CPU and 576Mi memory of requests across four components
-- One internet-facing load balancer, not two: ArgoCD stays `ClusterIP`
+- Observability stack sized to fit in the remaining headroom, all five components with
+  explicit requests and limits
+- One internet-facing load balancer, not three: ArgoCD and Grafana both stay `ClusterIP`
 
 Right-sizing is evidence-driven. VPA and Goldilocks run in recommendation mode, and the HPA
 ceiling was lowered from 6 to 5 after 6 was proven unschedulable against the real node
@@ -643,6 +971,37 @@ kubectl get nodes
 helm history multimodal-rag -n default
 ```
 
+Observability stack:
+
+```bash
+kubectl get pods,pvc -n observability
+```
+
+Grafana, both datasources behind one login:
+
+```bash
+kubectl -n observability port-forward svc/grafana 3000:80
+```
+
+Then open `http://localhost:3000`. The admin password, read from the secret Terraform
+generated it into:
+
+```bash
+kubectl -n observability get secret grafana-admin -o jsonpath='{.data.admin-password}' | base64 -d; echo
+```
+
+On Windows PowerShell, where `base64` does not exist:
+
+```
+kubectl -n observability get secret grafana-admin -o jsonpath='{.data.admin-password}' | ForEach-Object { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($_)) }
+```
+
+Prometheus targets, without exposing it:
+
+```bash
+kubectl -n observability port-forward svc/prometheus-server 9090:80
+```
+
 ArgoCD:
 
 ```bash
@@ -654,12 +1013,6 @@ password:
 
 ```bash
 kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d; echo
-```
-
-On Windows PowerShell, where `base64` does not exist:
-
-```
-kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | ForEach-Object { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($_)) }
 ```
 
 Backups:
@@ -679,17 +1032,38 @@ terraform plan
 
 ## Platform roadmap
 
+**The ingestion worker.** Kafka is deployed with no consumer. The application half of that
+work publishes an ingest job on upload and runs extraction, encoding and indexing in a
+separate worker Deployment. That is what makes multiple UI replicas safe again, and it is the
+change that closes the exit-137 story properly rather than working around it.
+
+**Application metrics.** Prometheus scrapes 18 of 18 targets today, but all of them are
+platform-level: node exporter, kube-state-metrics, the API server, and the Kafka JMX
+exporter. The application pods carry no `prometheus.io/scrape` annotation and export no
+metrics, so request latency, retrieval time and per-model gateway cost are not on a dashboard
+yet. The instrumentation is scoped and the scrape configuration already handles annotated
+pods; the pods just have nothing to scrape.
+
 **The GitOps cutover.** CI should stop running `helm upgrade --install` and instead write the
 image tag into git, leaving ArgoCD as the only thing that talks to the cluster. This is the
-change that turns the current honest `OutOfSync` into a genuine `Synced`, and it is the main
-outstanding piece of platform work.
+change that turns the current honest `OutOfSync` into a genuine `Synced`.
 
 **Terraform apply and destroy from the pipeline**, with destroy behind a `workflow_dispatch`
 trigger and a GitHub Environment requiring a named reviewer. Infrastructure changes should
 go through the same review path as code, and destruction should require a human to say yes.
 
-**Persistent volume backup coverage**, as described above, on the day anything stateful is
-introduced.
+**Verify a volume restore.** The four observability PVCs now exist and Velero's snapshot path
+is enabled, but a restore has not been performed. A backup nobody has restored from is a
+hypothesis.
+
+**Move the last piece of configuration drift into code.** An Elasticsearch index template
+setting `number_of_replicas: 0` for `kube-*` indices was applied by hand against the API. It
+is correct (a single node cannot assign a replica, so every index otherwise sits yellow), but
+it exists only in the running cluster. A rebuild would not reproduce it.
+
+**Restore the Elasticsearch metrics exporter** once the node group has room, either on larger
+instances, with more nodes, or with VPC CNI prefix delegation raising the per-node pod
+ceiling.
 
 **Action version currency.** Several actions still emit Node.js 20 deprecation warnings, and
 Terraform is one minor version behind. Neither is breaking; both are the kind of maintenance
@@ -703,15 +1077,20 @@ that is cheap now and expensive when deferred.
 .
 ├── src/                        # AI system
 │   ├── api.py                  # FastAPI service
-│   ├── ingest.py               # PDF text and image extraction
+│   ├── ingest.py               # PDF extraction, heading-aware chunking
 │   ├── encoders.py             # MiniLM text tower, CLIP image tower
 │   ├── index.py                # FAISS indexes, lexical rerank
 │   ├── answer.py               # Context assembly and generation
 │   ├── a2a.py                  # Retriever and verifier loop
-│   ├── gateway.py              # LiteLLM gateway, fallbacks, cost audit
+│   ├── gateway.py              # LLM gateway, fallbacks, rate limits, cost audit
 │   ├── guard.py                # NeMo Guardrails integration
 │   └── config.py               # Typed immutable settings
-├── evals/                      # DeepEval suites and judge wrapper
+├── evals/                      # DeepEval suites
+│   ├── test_multimodal_rag.py  # 5 goldens x 3 metrics
+│   ├── test_retriever.py       # Retrieval quality
+│   ├── test_leakage.py         # PII and prompt-leak probes
+│   ├── robust_judge.py         # Compact retry + larger-output fallback judge
+│   └── json_repair_patch.py    # Repairs malformed judge JSON before GEval
 ├── goldens/                    # Evaluation goldens
 ├── guardrails/                 # NeMo Guardrails configuration
 ├── tests/                      # Unit and integration tests
@@ -723,7 +1102,10 @@ that is cheap now and expensive when deferred.
 │   ├── values.yaml
 │   └── templates/              # deployments, services, hpa, pdb, configmap, secret
 ├── terraform/                  # EC2 stack
-│   └── eks/                    # EKS stack: cluster, network, iam, addons, argocd, velero, ecr
+│   └── eks/                    # EKS stack, one file per concern:
+│                               #   network, cluster, iam, ecr, addons, storage,
+│                               #   argocd, velero, kafka, elasticsearch,
+│                               #   fluentbit, prometheus, grafana
 ├── ansible/                    # EC2 host configuration, vaulted secrets
 ├── .github/workflows/          # 7-job CI/CD pipeline
 ├── Dockerfile                  # UI image

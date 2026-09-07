@@ -85,7 +85,11 @@ A standalone Kafka consumer, runnable as `python -m src.ingest_worker`.
    `src.ingest.ingest_pdf`, build a `MultimodalIndex`, and persist the result so
    the UI can pick it up. Persist as a pickle under a directory from a NEW
    setting `ingest_output_dir` (env `INGEST_OUTPUT_DIR`, default
-   `str(SETTINGS.ARTIFACTS_DIR / "uploads")`). Name the file by job id.
+   `str(ARTIFACTS_DIR / "uploads")`). Name the file by job id.
+   **`ARTIFACTS_DIR` is a module-level constant in `src/config.py` (defined near
+   line 23 as `ROOT / "artifacts"`), not a field on the `Settings` dataclass.**
+   Reference it directly. Writing `SETTINGS.ARTIFACTS_DIR` raises
+   `AttributeError` at import time and takes the whole worker down on startup.
    State clearly in a comment that this requires a shared ReadWriteMany volume
    or a single UI replica to be visible to the UI, and that it is the known
    limitation of this design.
