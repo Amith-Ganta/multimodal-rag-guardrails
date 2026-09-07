@@ -8,13 +8,21 @@ spec:
   type: LoadBalancer
   selector:
     app: multimodal-rag-ui
-  # Streamlit session state is per-pod in memory. Without ClientIP affinity an
-  # upload can land on pod A while the next request reaches pod B, which has no
-  # _uploaded_index and silently falls back to the sample document.
+  # Streamlit session state is per-pod in memory, so a request that reaches a
+  # different pod from the upload finds no _uploaded_index and falls back to the
+  # sample document. ClientIP affinity looks like the fix but the in-tree AWS
+  # provider rejects it on a classic ELB ("unsupported load balancer affinity:
+  # ClientIP") while the API server still accepts and reports the field, so it
+  # fails silently. The UI is therefore pinned to a single replica instead, and
+  # this stays None. See the note in values.yaml.
   sessionAffinity: {{ .Values.ui.sessionAffinity }}
+  {{- if eq .Values.ui.sessionAffinity "ClientIP" }}
+  # Kubernetes rejects this block when sessionAffinity is None, so it is only
+  # rendered for the mode it belongs to.
   sessionAffinityConfig:
     clientIP:
       timeoutSeconds: {{ .Values.ui.sessionAffinityTimeoutSeconds }}
+  {{- end }}
   ports:
     - port: 80
       targetPort: {{ .Values.ui.port }}

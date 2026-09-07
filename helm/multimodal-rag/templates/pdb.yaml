@@ -14,7 +14,17 @@ kind: PodDisruptionBudget
 metadata:
   name: multimodal-rag-ui
 spec:
-  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  # The UI runs a single replica on purpose (see values.yaml), so minAvailable
+  # of 1 would permit zero voluntary evictions and block node drains and
+  # autoscaler consolidation forever. maxUnavailable of 1 still protects against
+  # an accidental mass eviction while letting the node lifecycle proceed. The
+  # tradeoff is accepted: a drain briefly interrupts the UI, which for a stateful
+  # single replica it would do regardless.
+  # Defaulted rather than referenced bare: a PDB that renders with neither
+  # minAvailable nor maxUnavailable is accepted by the API server and then
+  # permits zero disruptions, wedging every drain. An absent value must not be
+  # able to produce that manifest.
+  maxUnavailable: {{ .Values.podDisruptionBudget.uiMaxUnavailable | default 1 }}
   selector:
     matchLabels:
       app: multimodal-rag-ui

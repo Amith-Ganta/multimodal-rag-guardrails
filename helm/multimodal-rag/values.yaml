@@ -53,15 +53,27 @@ api:
     failureThreshold: 3
 
 ui:
-  replicaCount: 2
+  replicaCount: 1
   port: 8501
   # Streamlit keeps the uploaded document's index in per-pod, in-memory session
-  # state. With sessionAffinity None and 2 replicas the upload landed on pod A
-  # and the next request round-robined to pod B, which had no index and silently
-  # answered from the sample PDF instead. ClientIP pins a client to one pod for
-  # 3h, which is longer than any realistic single working session.
-  sessionAffinity: ClientIP
-  sessionAffinityTimeoutSeconds: 10800
+  # state, so a request served by any pod other than the one that received the
+  # upload silently answers from the sample PDF instead.
+  #
+  # sessionAffinity: ClientIP was the first attempt at pinning a client to one
+  # pod. It does not work here. The in-tree AWS provider rejects it on a classic
+  # ELB and the Service reconcile loop fails with "unsupported load balancer
+  # affinity: ClientIP", while `kubectl describe svc` still reports the field as
+  # set. The setting is accepted by the API server and then quietly discarded by
+  # the cloud provider, so it verified as applied while doing nothing at all.
+  #
+  # Until ingest moves off the request path (see docs/OBSERVABILITY_BUILD_PLAN.md
+  # for the Kafka worker plan) the only reliable fix is to have exactly one UI
+  # pod, so every request necessarily reaches the pod holding the session. That
+  # is why autoscaling is disabled below rather than merely bounded: an HPA
+  # scale-down deletes a pod, and if that pod holds the uploaded index the user's
+  # document disappears mid-session. Observed live: the HPA scaled 2 -> 3 during
+  # a 13.5 MB ingest and back to 2 eighty seconds later, destroying the upload.
+  sessionAffinity: None
   # The UI pod runs ingest in-process, so it carries a ~527 MB Python import
   # baseline plus ~248 MB transient per concurrent upload. A 512Mi request sat
   # below that baseline, so the HPA read 81% of its 80% memory target at idle
@@ -82,10 +94,15 @@ ui:
     limits:
       cpu: 500m
       memory: 2560Mi
+  # Disabled deliberately, not left unconfigured. See the sessionAffinity note
+  # above: the UI is stateful per pod, so horizontal scaling actively destroys
+  # user sessions rather than serving more of them. The API tier is stateless
+  # and keeps its HPA, so load still scales where scaling is safe. Re-enable
+  # this only once ingest state lives outside the pod.
   autoscaling:
-    enabled: true
-    minReplicas: 2
-    maxReplicas: 4
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 1
     targetCPUUtilizationPercentage: 70
     targetMemoryUtilizationPercentage: 80
   livenessProbe:
@@ -142,7 +159,11 @@ secrets:
 
 podDisruptionBudget:
   enabled: true
+  # Applies to the API tier, which runs 2+ stateless replicas.
   minAvailable: 1
+  # The UI tier is a single stateful replica, so it needs maxUnavailable rather
+  # than minAvailable, or nothing could ever drain the node it sits on.
+  uiMaxUnavailable: 1
 
 serviceAccount:
   create: false
