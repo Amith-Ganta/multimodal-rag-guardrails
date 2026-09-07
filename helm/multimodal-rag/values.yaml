@@ -55,19 +55,33 @@ api:
 ui:
   replicaCount: 2
   port: 8501
+  # Streamlit keeps the uploaded document's index in per-pod, in-memory session
+  # state. With sessionAffinity None and 2 replicas the upload landed on pod A
+  # and the next request round-robined to pod B, which had no index and silently
+  # answered from the sample PDF instead. ClientIP pins a client to one pod for
+  # 3h, which is longer than any realistic single working session.
+  sessionAffinity: ClientIP
+  sessionAffinityTimeoutSeconds: 10800
   # The UI pod runs ingest in-process, so it carries a ~527 MB Python import
   # baseline plus ~248 MB transient per concurrent upload. A 512Mi request sat
   # below that baseline, so the HPA read 81% of its 80% memory target at idle
   # and pods were OOMKilled with no traffic at all. The request now sits above
   # the baseline and the limit absorbs the baseline plus two concurrent uploads
   # (527 + 2*248 = ~1023 MB) with headroom.
+  #
+  # 1536Mi was then OOMKilled (exit 137) by a 13.5 MB CAD tutorial: that sizing
+  # assumed a text-heavy paper, but an image-heavy PDF rasterizes hundreds of
+  # page images for CLIP. The limit now covers one such document. The request is
+  # deliberately unchanged, because the request is what the HPA measures against
+  # and what the scheduler packs on, and raising it would cost 4 nodes of
+  # headroom to protect against a case the MAX_UPLOAD_MB guard already bounds.
   resources:
     requests:
       cpu: 250m
       memory: 768Mi
     limits:
       cpu: 500m
-      memory: 1536Mi
+      memory: 2560Mi
   autoscaling:
     enabled: true
     minReplicas: 2
@@ -115,6 +129,10 @@ config:
   EVAL_THRESHOLD: "0.7"
   VERIFY_ANSWERS: "false"
   VERIFY_MAX_RETRIES: "1"
+  # Upload ceiling for the in-process ingest path. Sized against the UI memory
+  # limit above: past this, rasterizing the pages OOMKills the pod rather than
+  # failing the one request.
+  MAX_UPLOAD_MB: "25"
 
 # Secret values. CI supplies these via --set-string secrets.* from GitHub
 # Actions secrets - never committed here. Leave blank for local `helm template`.

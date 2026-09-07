@@ -15,6 +15,7 @@ Build the index first:
 from __future__ import annotations
 
 import base64
+import os
 import tempfile
 from pathlib import Path
 
@@ -128,16 +129,27 @@ with st.sidebar:
         # Rebuild only when a different file is uploaded, not on every rerun.
         sig = (uploaded.name, uploaded.size)
         if st.session_state.get("_uploaded_sig") != sig:
-            with st.spinner(f"Ingesting {uploaded.name} (text + images)..."):
-                try:
-                    st.session_state["_uploaded_index"] = _build_index_from_pdf(
-                        uploaded.getvalue(), doc_id=Path(uploaded.name).stem
-                    )
-                    st.session_state["_uploaded_sig"] = sig
-                except Exception as exc:  # surface the reason, do not crash the app
-                    st.session_state.pop("_uploaded_index", None)
-                    st.session_state.pop("_uploaded_sig", None)
-                    st.error(f"Could not read that PDF: {exc}")
+            # Ingest runs in this pod's own process, so an oversized PDF does not
+            # fail one request, it OOMKills the container and takes every other
+            # session on the pod with it. Reject above the cap instead.
+            max_upload_mb = int(os.getenv("MAX_UPLOAD_MB", "25"))
+            if uploaded.size > max_upload_mb * 1024 * 1024:
+                st.error(
+                    f"That PDF is {uploaded.size / (1024 * 1024):.1f} MB, above the "
+                    f"{max_upload_mb} MB cap this instance can ingest in memory. "
+                    "Please upload a smaller PDF."
+                )
+            else:
+                with st.spinner(f"Ingesting {uploaded.name} (text + images)..."):
+                    try:
+                        st.session_state["_uploaded_index"] = _build_index_from_pdf(
+                            uploaded.getvalue(), doc_id=Path(uploaded.name).stem
+                        )
+                        st.session_state["_uploaded_sig"] = sig
+                    except Exception as exc:  # surface the reason, do not crash the app
+                        st.session_state.pop("_uploaded_index", None)
+                        st.session_state.pop("_uploaded_sig", None)
+                        st.error(f"Could not read that PDF: {exc}")
         idx = st.session_state.get("_uploaded_index")
         if idx is not None:
             n_txt, n_img = getattr(idx, "_uploaded_stats", (0, 0))
@@ -171,6 +183,18 @@ if index is None:
         "It can contain both text and images."
     )
     st.stop()
+
+# A file attached in the sidebar with no index behind it means this session lost
+# its state: the pod restarted, or the load balancer moved us to a pod that never
+# saw the upload. Say so. Answering from the sample document without a word is
+# the worst outcome here, because the answers look confident and cite the wrong
+# document entirely.
+if uploaded is not None and st.session_state.get("_uploaded_index") is None:
+    st.warning(
+        f"**{uploaded.name} is not loaded in this session.** Answers below would come "
+        "from the default paper, not your file. Re-upload it in the sidebar to ask "
+        "questions about that document."
+    )
 
 active_label = (
     "your uploaded PDF"

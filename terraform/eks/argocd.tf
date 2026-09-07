@@ -156,6 +156,36 @@ resource "helm_release" "argocd_apps" {
             server    = "https://kubernetes.default.svc"
             namespace = "default"
           }
+          # CI owns the image tag until the GitOps cutover, so ArgoCD must never
+          # diff or apply that field. Manual-sync alone did not prevent this: a
+          # human pressed SYNC in the ArgoCD UI, which rendered the chart from
+          # git (where image.*.repository is empty) and rewrote both live
+          # Deployments to a bare ":latest". Ignoring the field makes that
+          # button safe to press.
+          ignoreDifferences = [
+            {
+              group        = "apps"
+              kind         = "Deployment"
+              name         = "multimodal-rag-api"
+              jsonPointers = ["/spec/template/spec/containers/0/image"]
+            },
+            {
+              group        = "apps"
+              kind         = "Deployment"
+              name         = "multimodal-rag-ui"
+              jsonPointers = ["/spec/template/spec/containers/0/image"]
+            },
+            # the same empty-git-values sync also blanked both secret keys,
+            # measured as OPENAI_len=0 GROQ_len=0 inside a pod, so ignore the
+            # whole data object to also cover any future keys CI may add.
+            {
+              group        = ""
+              kind         = "Secret"
+              name         = "multimodal-rag-secrets"
+              namespace    = "default"
+              jsonPointers = ["/data"]
+            }
+          ]
           # Manual sync only. selfHeal = false was not enough: an automated
           # policy still runs one initial sync, and git does not yet carry the
           # image tag (CI injects it with --set at deploy time), so that sync

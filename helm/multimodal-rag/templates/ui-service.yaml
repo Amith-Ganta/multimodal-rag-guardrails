@@ -8,6 +8,13 @@ spec:
   type: LoadBalancer
   selector:
     app: multimodal-rag-ui
+  # Streamlit session state is per-pod in memory. Without ClientIP affinity an
+  # upload can land on pod A while the next request reaches pod B, which has no
+  # _uploaded_index and silently falls back to the sample document.
+  sessionAffinity: {{ .Values.ui.sessionAffinity }}
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: {{ .Values.ui.sessionAffinityTimeoutSeconds }}
   ports:
     - port: 80
       targetPort: {{ .Values.ui.port }}
