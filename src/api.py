@@ -37,7 +37,7 @@ _GUARD = None
 def _load_index():
     """Load the index and build the guarded pipeline once, at startup.
 
-    Any failure here (no index yet, a partial/corrupt index, a faiss or pickle
+    Any failure here (no index yet, a partial/corrupt index, a faiss or payload
     read error, or a GuardedRAG construction failure) leaves both globals None
     and is logged rather than raised, so the process still starts and the ask
     endpoints return a clean 503 instead of the whole service crashing on boot.

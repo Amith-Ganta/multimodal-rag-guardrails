@@ -34,7 +34,7 @@ def _load_index():
 
     A missing index is the expected first-run case and returns None quietly so
     the page prompts for an upload. Any other failure (a partial or corrupt
-    index, a faiss or pickle read error) also returns None but surfaces the
+    index, a faiss or payload read error) also returns None but surfaces the
     reason, so a broken sample index degrades to "upload a PDF" instead of
     crashing the whole page.
     """
